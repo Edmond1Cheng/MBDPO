@@ -1,8 +1,7 @@
 # Contributing to MBDPO
 
 Thank you for your interest in contributing to **MBDPO**! This is a research codebase
-released to accompany our technical report *"Model-Based Diffusion Policy Optimization in
-World Models."* We welcome bug reports, questions, and code contributions from
+released to accompany our technical report *"Scaling World-Model Reinforcement Learning Through Diffusion Policy Optimization."* We welcome bug reports, questions, and code contributions from
 the community.
 
 Because this is a research project maintained alongside other work, we may not
