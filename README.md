@@ -124,7 +124,7 @@ requests all help. To get started, please open an
 
 For details on reporting bugs, the pull request process, and code style, see
 [CONTRIBUTING.md](CONTRIBUTING.md). For questions about the paper itself, feel
-free to contact the corresponding authors.
+free to contact Xiaoyuan Cheng: \url{ucesxc4@ucl.ac.uk} and Wenxuan Yuan: \url{YUAN0186@e.ntu.edu.sg}..
 
 ## License
 
