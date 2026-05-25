@@ -1,6 +1,6 @@
-# MBDPO: Model-Based Diffusion Policy Optimization in World Models
+# MBDPO: Scaling World-Model Reinforcement Learning Through Diffusion Policy Optimization
 
-Official implementation of **"Model-Based Diffusion Policy Optimization in World Models"** by
+Official implementation of **"Scaling World-Model Reinforcement Learning Through Diffusion Policy Optimization"** by
 
 **Xiaoyuan Cheng***, **Wenxuan Yuan***, Zhancun Mu, Yuanzhao Zhang, Yiming Yang, Hai Wang, Zhuo Sun<sup>†</sup>, Che Liu<sup>†</sup>
 
