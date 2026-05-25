@@ -1,0 +1,202 @@
+import csv
+from time import time
+from pathlib import Path
+
+import numpy as np
+import torch
+from tensordict.tensordict import TensorDict
+from common.replay_buffer_saver import ReplayBufferSaver
+from trainer.base import Trainer
+
+MANISKILL2_TASKS = {"lift-cube", "pick-cube", "stack-cube", "pick-ycb", "turn-faucet"}
+
+
+class OnlineTrainer(Trainer):
+    """Trainer class for single-task online TD-MPC2 training."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._step = 0
+        self._ep_idx = 0
+        self._start_time = time()
+        self._replay_saver = ReplayBufferSaver(self.cfg)
+        self._reward_csv_fp = None
+        self._reward_csv_mode = None
+        self._csv_eval_freq = int(getattr(self.cfg, "csv_eval_freq", 50_000) or 50_000)
+        if bool(getattr(self.cfg, "save_reward_csv", False)):
+            reward_csv_dir = Path(str(getattr(self.cfg, "reward_csv_dir", "")))
+            reward_csv_dir.mkdir(parents=True, exist_ok=True)
+            self._reward_csv_fp = (
+                reward_csv_dir / f"{self.cfg.task}_{self.cfg.seed}.csv"
+            )
+            save_eval_success = (
+                str(self.cfg.task).startswith("mw-")
+                or str(self.cfg.task).startswith("myo-")
+                or str(self.cfg.task) in MANISKILL2_TASKS
+            )
+            self._reward_csv_mode = (
+                "eval_success" if save_eval_success else "eval_reward"
+            )
+            with open(self._reward_csv_fp, "w", newline="") as f:
+                writer = csv.writer(f)
+                if self._reward_csv_mode == "eval_success":
+                    writer.writerow(["step", "episode_success"])
+                else:
+                    writer.writerow(["step", "episode_reward"])
+
+    def _append_reward_csv(self, step, reward):
+        if self._reward_csv_fp is None:
+            return
+        with open(self._reward_csv_fp, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([int(step), float(reward)])
+
+    def _append_eval_success_csv(self, step, success):
+        if self._reward_csv_fp is None:
+            return
+        with open(self._reward_csv_fp, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([int(step), float(success)])
+
+    def common_metrics(self):
+        """Return a dictionary of current metrics."""
+        elapsed_time = time() - self._start_time
+        return dict(
+            step=self._step,
+            episode=self._ep_idx,
+            elapsed_time=elapsed_time,
+            steps_per_second=self._step / elapsed_time,
+        )
+
+    def eval(self):
+        """Evaluate a TD-MPC2 agent."""
+        ep_rewards, ep_successes, ep_lengths = [], [], []
+        for i in range(self.cfg.eval_episodes):
+            obs, done, ep_reward, t = self.env.reset(), False, 0, 0
+            if self.cfg.save_video:
+                self.logger.video.init(self.env, enabled=(i == 0))
+            while not done:
+                action = self.agent.act(obs, t0=t == 0, eval_mode=True)
+                obs, reward, done, info = self.env.step(action)
+                ep_reward += reward
+                t += 1
+                if self.cfg.save_video:
+                    self.logger.video.record(self.env)
+            ep_rewards.append(ep_reward)
+            ep_successes.append(info["success"])
+            ep_lengths.append(t)
+            if self.cfg.save_video:
+                self.logger.video.save(self._step)
+        return dict(
+            episode_reward=np.nanmean(ep_rewards),
+            episode_success=np.nanmean(ep_successes),
+            episode_length=np.nanmean(ep_lengths),
+        )
+
+    def to_td(self, obs, action=None, reward=None, terminated=None):
+        """Creates a TensorDict for a new episode."""
+        if isinstance(obs, dict):
+            obs = TensorDict(obs, batch_size=(), device="cpu")
+        else:
+            obs = obs.unsqueeze(0).cpu()
+        if action is None:
+            action = torch.full_like(self.env.rand_act(), float("nan"))
+        if reward is None:
+            reward = torch.tensor(float("nan"))
+        if terminated is None:
+            terminated = torch.tensor(float("nan"))
+        td = TensorDict(
+            obs=obs,
+            action=action.unsqueeze(0),
+            reward=reward.unsqueeze(0),
+            terminated=terminated.unsqueeze(0),
+            batch_size=(1,),
+        )
+        return td
+
+    def train(self):
+        """Train a TD-MPC2 agent."""
+        train_metrics, done, eval_next = {}, True, False
+        eval_freq = int(getattr(self.cfg, "eval_freq", 0) or 0)
+        save_model_every = int(getattr(self.cfg, "save_model_every", 100_000) or 0)
+        while self._step <= self.cfg.steps:
+            # Evaluate agent periodically
+            if eval_freq > 0 and self._step % eval_freq == 0:
+                eval_next = True
+                if (
+                    self._reward_csv_mode in {"eval_success", "eval_reward"}
+                    and self._step > 0
+                    and self._step % self._csv_eval_freq == 0
+                ):
+                    eval_next = True
+
+            # Save model periodically (independent from eval)
+            if (
+                save_model_every > 0
+                and self._step > 0
+                and self._step % save_model_every == 0
+            ):
+                self.logger.save_agent(self.agent, identifier=f"{self._step}")
+
+            # Reset environment
+            if done:
+                if eval_next:
+                    eval_metrics = self.eval()
+                    if self._reward_csv_mode == "eval_success":
+                        self._append_eval_success_csv(
+                            self._step, eval_metrics["episode_success"]
+                        )
+                    elif self._reward_csv_mode == "eval_reward":
+                        self._append_reward_csv(
+                            self._step, eval_metrics["episode_reward"]
+                        )
+                    eval_metrics.update(self.common_metrics())
+                    self.logger.log(eval_metrics, "eval")
+                    eval_next = False
+
+                if self._step > 0:
+                    if info["terminated"] and not self.cfg.episodic:
+                        raise ValueError(
+                            "Termination detected but you are not in episodic mode. "
+                            "Set `episodic=true` to enable support for terminations."
+                        )
+                    episode_td = torch.cat(self._tds)
+                    train_metrics.update(
+                        episode_reward=torch.tensor(
+                            [td["reward"] for td in self._tds[1:]]
+                        ).sum(),
+                        episode_success=info["success"],
+                        episode_length=len(self._tds),
+                        episode_terminated=info["terminated"],
+                    )
+                    train_metrics.update(self.common_metrics())
+                    self.logger.log(train_metrics, "train")
+                    self._replay_saver.add_episode(episode_td)
+                    self._ep_idx = self.buffer.add(episode_td)
+
+                obs = self.env.reset()
+                self._tds = [self.to_td(obs)]
+
+            # Collect experience
+            if self._step > self.cfg.seed_steps:
+                action = self.agent.act(obs, t0=len(self._tds) == 1)
+            else:
+                action = self.env.rand_act()
+            obs, reward, done, info = self.env.step(action)
+            self._tds.append(self.to_td(obs, action, reward, info["terminated"]))
+
+            # Update agent
+            if self._step >= self.cfg.seed_steps:
+                if self._step == self.cfg.seed_steps:
+                    num_updates = self.cfg.seed_steps
+                    print("Pretraining agent on seed data...")
+                else:
+                    num_updates = 1
+                for _ in range(num_updates):
+                    _train_metrics = self.agent.update(self.buffer)
+                train_metrics.update(_train_metrics)
+
+            self._step += 1
+
+        self._replay_saver.finish()
+        self.logger.finish(self.agent)

@@ -1,0 +1,120 @@
+defaults:
+    - override hydra/launcher: submitit_local
+
+# environment
+task: dog-run
+obs: state
+episodic: false
+
+# evaluation
+checkpoint: ???
+load_checkpoint: true
+mt80_obs_dim: 39
+mt80_action_dim: 7
+mt80_action_dims: []
+save_path: ???
+off2on_task: ???
+off2on_eval_root: ???
+eval_episodes: 10
+eval_freq: 100_000
+eval_devices: 'cuda:0'
+save_model_every: 100_000
+
+# training
+steps: 4_000_000
+batch_size: 256
+reward_coef: 0.1
+value_coef: 0.1
+termination_coef: 1
+consistency_coef: 20
+contrastive_eta: 0.01
+g_coef: 1.0
+rho: 0.5
+lr: 3e-4
+enc_lr_scale: 0.3
+grad_clip_norm: 20
+tau: 0.01
+discount_denom: 5
+discount_min: 0.95
+discount_max: 0.995
+buffer_size: 1_000_000
+exp_name: default
+data_dir: ???
+offline_data_mode: in_memory # in_memory | mmap (recommended for packed multi-process offline training)
+save_replay: false
+replay_save_dir: ''
+replay_flush_every_episodes: 1000
+replay_include_terminated: false
+replay_task_id: -1
+save_reward_csv: false
+reward_csv_dir: ''
+csv_eval_freq: 100_000
+
+# planning
+horizon: 3
+diffusion_steps: 20
+diffusion_beta0: 1e-4
+diffusion_betaT: 1e-2
+diffusion_num_samples: 512
+diffusion_num_elites: 64
+diffusion_num_pi_trajs: 24
+diffusion_temperature: 0.5
+diffusion_action_noise: 0.05
+diffusion_eval_compile: false
+diffusion_eval_compile_mode: reduce-overhead
+use_score_network: false
+score_loss_coef: 1.0
+diffusion_time_embed_dim: 64
+
+
+# actor
+log_std_min: -10
+log_std_max: 2
+entropy_coef: 1e-4
+
+# critic
+num_bins: 101
+vmin: -10
+vmax: +10
+
+# architecture
+model_size: 6 # unit: million
+num_enc_layers: 2
+enc_dim: 256
+num_channels: 32
+mlp_dim: 512
+latent_dim: 512
+task_dim: 96
+num_q: 5
+dropout: 0.01
+simnorm_dim: 8
+
+# logging
+wandb_project: ???
+wandb_entity: ???
+wandb_silent: false
+enable_wandb: true
+save_csv: true
+offline_checkpoint_root: ???
+online_save_root: ???
+
+# misc
+compile: false
+compile_mode: reduce-overhead
+save_video: false
+save_agent: true
+seed: 1
+
+# convenience
+work_dir: ???
+task_title: ???
+multitask: ???
+tasks: ???
+obs_shape: ???
+action_dim: ???
+episode_length: ???
+obs_shapes: ???
+action_dims: ???
+episode_lengths: ???
+seed_steps: ???
+bin_size: ???

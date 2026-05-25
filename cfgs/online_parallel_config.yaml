@@ -1,0 +1,33 @@
+task_set: mt80
+tasks: []
+gpu_ids: []
+num_gpus: 2
+job_mode: seed
+workers_per_gpu: 3
+seeds: [1, 2, 3]
+dmc_steps: 4000000
+metaworld_steps: 2000000
+default_steps: 2000000
+obs: state
+compile: true
+compile_mode: max-autotune-no-cudagraphs
+diffusion_eval_compile: true
+diffusion_eval_compile_mode: max-autotune-no-cudagraphs
+eval_freq: 100000
+save_model_every: 100000
+save_replay: true
+replay_save_dir: ???
+replay_flush_every_episodes: 1000
+replay_include_terminated: false
+save_reward_csv: true
+csv_eval_freq: 100000
+merge_cleanup_temp: false
+python_bin: python
+train_entry: scripts/train.py
+exp_name: parallel-online-diffusion
+save_agent: true
+save_video: false
+enable_wandb: false
+common_overrides:
+  - online_save_root=???
+  - reward_csv_dir=???
