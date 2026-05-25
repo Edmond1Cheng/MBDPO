@@ -2,7 +2,8 @@
 
 Official implementation of **"Scaling World-Model Reinforcement Learning Through Diffusion Policy Optimization"** by
 
-**Xiaoyuan Cheng***, **Wenxuan Yuan***, Zhancun Mu, Yuanzhao Zhang, Yiming Yang, Hai Wang, Zhuo Sun<sup>†</sup>, Che Liu<sup>†</sup>
+**Xiaoyuan Cheng*** (ucesxc4@ucl.ac.uk), **Wenxuan Yuan*** (YUAN0186@e.ntu.edu.sg), Zhancun Mu, Yuanzhao Zhang, Yiming Yang, Hai Wang, Zhuo Sun<sup>†</sup>, Che Liu<sup>†</sup>
+
 
 <p align="center">
   <a href="https://arxiv.org/abs/XXXX.XXXXX"><img src="https://img.shields.io/badge/arXiv-paper-b31b1b.svg" alt="arXiv"></a>
