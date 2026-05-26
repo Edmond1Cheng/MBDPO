@@ -5,9 +5,16 @@ os.environ["MUJOCO_GL"] = os.getenv("MUJOCO_GL", "egl")
 os.environ["LAZY_LEGACY_OP"] = "0"
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 os.environ["TORCH_LOGS"] = "+recompiles"
+
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import warnings
 from copy import deepcopy
-from pathlib import Path
 
 import hydra
 import torch
