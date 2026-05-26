@@ -32,7 +32,7 @@ It controls how multiple jobs are generated and dispatched in parallel (task set
 
 Below are the most important groups, with emphasis on diffusion-related controls.
 
-### Planning / diffusion parameters (核心)
+### Diffusion parameters
 
 - `horizon`: rollout horizon used in imagined planning/optimization.
 - `diffusion_steps`: number of denoising steps per action-generation pass.
