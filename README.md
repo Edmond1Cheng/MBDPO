@@ -115,6 +115,7 @@ About parameter usage, please refer to this [description](cfgs/README.md)
 
 ## Citation
 
+```
 @misc{cheng2026scalingworldmodelreinforcementlearning,
       title={Scaling World-Model Reinforcement Learning Through Diffusion Policy Optimization}, 
       author={Xiaoyuan Cheng and Wenxuan Yuan and Zhancun Mu and Yuanzhao Zhang and Yiming Yang and Hai Wang and Zhuo Sun and Che Liu},
@@ -124,6 +125,7 @@ About parameter usage, please refer to this [description](cfgs/README.md)
       primaryClass={cs.LG},
       url={https://arxiv.org/abs/2605.26282}, 
 }
+```
 
 ## Contributing
 
