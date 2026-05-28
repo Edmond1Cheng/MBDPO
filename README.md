@@ -6,6 +6,7 @@ Official implementation of **"Scaling World-Model Reinforcement Learning Through
 
 
 <p align="center">
+  <a href="https://wenxuan52.github.io/mbdpo-page/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="Project Page"></a>
   <a href="https://arxiv.org/abs/2605.26282"><img src="https://img.shields.io/badge/arXiv-paper-b31b1b.svg" alt="arXiv"></a>
   <a href="https://huggingface.co/BruceYuan/MBDPO"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models%20%26%20Data-yellow" alt="Hugging Face"></a>
   <a href="https://github.com/Edmond1Cheng/MBDPO/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
