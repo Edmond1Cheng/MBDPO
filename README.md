@@ -36,22 +36,22 @@ The repository contains code for training and evaluating MBDPO across **121 cont
   <tr>
     <td align="center" width="25%">
       <b>Cheetah Run Front</b><br>
-      <img src="assets/gif/1.gif" width="220"><br>
+      <img src="assets/gif/1.gif" width="160"><br>
       Reward: 740.7
     </td>
     <td align="center" width="25%">
       <b>Cup Spin</b><br>
-      <img src="assets/gif/2.gif" width="220"><br>
+      <img src="assets/gif/2.gif" width="160"><br>
       Reward: 840.4
     </td>
     <td align="center" width="25%">
       <b>Reacher Hard</b><br>
-      <img src="assets/gif/3.gif" width="220"><br>
+      <img src="assets/gif/3.gif" width="160"><br>
       Reward: 985.0
     </td>
     <td align="center" width="25%">
       <b>Walker Run</b><br>
-      <img src="assets/gif/4.gif" width="220"><br>
+      <img src="assets/gif/4.gif" width="160"><br>
       Reward: 769.2
     </td>
   </tr>
@@ -67,25 +67,25 @@ The repository contains code for training and evaluating MBDPO across **121 cont
   <tr>
     <td align="center" width="25%">
       <b>Bin Picking</b><br>
-      <img src="assets/gif/5.gif" width="220"><br>
+      <img src="assets/gif/5.gif" width="160"><br>
       Reward: 1585.0<br>
       Success Rate: 1.00
     </td>
     <td align="center" width="25%">
       <b>Disassemble</b><br>
-      <img src="assets/gif/6.gif" width="220"><br>
+      <img src="assets/gif/6.gif" width="160"><br>
       Reward: 1556.2<br>
       Success Rate: 1.00
     </td>
     <td align="center" width="25%">
       <b>Door Close</b><br>
-      <img src="assets/gif/7.gif" width="220"><br>
+      <img src="assets/gif/7.gif" width="160"><br>
       Reward: 1549.1<br>
       Success Rate: 1.00
     </td>
     <td align="center" width="25%">
       <b>Lever Pull</b><br>
-      <img src="assets/gif/8.gif" width="220"><br>
+      <img src="assets/gif/8.gif" width="160"><br>
       Reward: 1664.9<br>
       Success Rate: 0.90
     </td>
