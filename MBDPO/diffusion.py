@@ -2,7 +2,7 @@ import torch
 
 
 class Diffusion:
-    """No-gradient model-based diffusion planner for TD-MPC2."""
+    """Gradient-free model-based diffusion policy."""
 
     def __init__(self, cfg):
         self.cfg = cfg
