@@ -305,7 +305,7 @@ def _gpu_worker_seed_mode(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Launch parallel single-task online TD-MPC2 training jobs."
+        description="Launch parallel single-task online MBDPO training jobs."
     )
     parser.add_argument(
         "--config",
