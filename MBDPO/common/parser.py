@@ -12,7 +12,7 @@ from common import MODEL_SIZE, TASK_SET
 def cfg_to_dataclass(cfg, frozen=False):
     """
     Converts an OmegaConf config to a dataclass object.
-    This prevents graph breaks when used with torch.compile.
+    This keeps downstream JAX code on a stable immutable-style config surface.
     """
     cfg_dict = OmegaConf.to_container(cfg)
     fields = []

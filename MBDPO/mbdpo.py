@@ -1,752 +1,548 @@
-import torch
-import torch.nn.functional as F
+import functools
+import pickle
+from typing import Dict
 
-from common import math
-from common.scale import RunningScale
-from common.world_model import WorldModel
-from common.layers import api_model_conversion
-from diffusion import Diffusion
-from tensordict import TensorDict
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+
+from .common import math as jm
+from .common import world_model as wm
+from .diffusion import make_plan_step
 
 
-class MBDPO(torch.nn.Module):
-    """
-    TD-MPC2 agent. Implements training + inference.
-    Can be used for both single-task and multi-task experiments,
-    and supports both state and pixel observations.
-    """
+def _zeros_like_tree(tree):
+    return jax.tree_util.tree_map(jnp.zeros_like, tree)
+
+
+def _label_tree(tree, label):
+    return jax.tree_util.tree_map(lambda _: label, tree)
+
+
+def make_model_tx(spec: wm.ModelSpec, params):
+    labels = {
+        "encoder": _label_tree(params["encoder"], "encoder"),
+        "dynamics": _label_tree(params["dynamics"], "model"),
+        "reward": _label_tree(params["reward"], "model"),
+        "pi": _label_tree(params["pi"], "policy"),
+        "f": _label_tree(params["f"], "model"),
+        "termination": _label_tree(params["termination"], "model"),
+        "score": _label_tree(params["score"], "model"),
+        "qs": _label_tree(params["qs"], "model"),
+    }
+    if spec.multitask:
+        labels["task_emb"] = _label_tree(params["task_emb"], "model")
+    return optax.chain(
+        optax.clip_by_global_norm(spec.grad_clip_norm),
+        optax.multi_transform(
+            {
+                "encoder": optax.adam(spec.lr * spec.enc_lr_scale),
+                "model": optax.adam(spec.lr),
+                "policy": optax.set_to_zero(),
+            },
+            labels,
+        ),
+    )
+
+
+def _global_norm(tree):
+    leaves = jax.tree_util.tree_leaves(tree)
+    return jnp.sqrt(sum([jnp.sum(jnp.square(x)) for x in leaves]))
+
+
+def _percentile_scale(x):
+    flat = jnp.sort(jnp.reshape(x, (x.shape[0], -1)), axis=0)
+    n = flat.shape[0]
+    positions = jnp.asarray([5.0, 95.0], dtype=x.dtype) * (n - 1) / 100.0
+    floored = jnp.floor(positions).astype(jnp.int32)
+    ceiled = jnp.minimum(floored + 1, n - 1)
+    w_ceil = positions - floored.astype(x.dtype)
+    w_floor = 1.0 - w_ceil
+    values = flat[floored] * w_floor[:, None] + flat[ceiled] * w_ceil[:, None]
+    return jnp.maximum(jnp.reshape(values[1] - values[0], x.shape[1:]), 1.0)
+
+
+def _normalize_contrastive(score, mean, std, clip):
+    std = jnp.maximum(std, 1e-6)
+    return jnp.clip((score - mean) / std, -clip, clip)
+
+
+def _estimate_value(
+    params,
+    z,
+    actions,
+    spec: wm.ModelSpec,
+    contrastive_mean,
+    contrastive_std,
+    key,
+    task=None,
+):
+    key, tail_pi_key, tail_q_key = jax.random.split(key, 3)
+
+    def body(carry, action_t):
+        z_t, ret, discount_t, termination_t = carry
+        reward_t = jm.two_hot_inv(
+            wm.reward(params, z_t, action_t, spec, task=task),
+            spec.num_bins,
+            spec.vmin,
+            spec.vmax,
+        )
+        f_score = wm.contrastive_f(params, z_t, action_t, spec, task=task)
+        f_norm = _normalize_contrastive(
+            f_score, contrastive_mean, contrastive_std, spec.contrastive_clip
+        )
+        shaped_reward = reward_t + spec.contrastive_eta * f_norm
+        z_next = wm.next_latent(params, z_t, action_t, spec, task=task)
+        ret = ret + discount_t * (1.0 - termination_t) * shaped_reward
+        discount_t = discount_t * wm.discount(task, spec, z_t)
+        if spec.episodic:
+            termination_t = jnp.clip(
+                termination_t
+                + (wm.termination(params, z_next, spec, task=task) > 0.5).astype(
+                    z_t.dtype
+                ),
+                max=1.0,
+            )
+        return (z_next, ret, discount_t, termination_t), None
+
+    init = (
+        z,
+        jnp.zeros((z.shape[0], 1), dtype=z.dtype),
+        jnp.ones((z.shape[0], 1), dtype=z.dtype),
+        jnp.zeros((z.shape[0], 1), dtype=z.dtype),
+    )
+    (z_final, ret, discount_t, termination_t), _ = jax.lax.scan(body, init, actions)
+    tail_action, _ = wm.pi(params, z_final, tail_pi_key, spec, task=task)
+    return ret + discount_t * (1.0 - termination_t) * wm.q_value(
+        params, z_final, tail_action, spec, "avg", key=tail_q_key, task=task
+    )
+
+
+def _task_for_horizon(task, horizon):
+    if task is None:
+        return None
+    return jnp.repeat(jnp.reshape(task, (-1,)), horizon)
+
+
+def _contrastive_loss(params, zs, actions, key, spec: wm.ModelSpec, task=None):
+    z_flat = jax.lax.stop_gradient(jnp.reshape(zs, (-1, zs.shape[-1])))
+    a_pos = jnp.reshape(jnp.swapaxes(actions, 0, 1), (-1, actions.shape[-1]))
+    task_flat = _task_for_horizon(task, spec.horizon)
+    pos_logits = wm.contrastive_f(params, z_flat, a_pos, spec, task=task_flat)
+    pos_loss = jm.bce_with_logits(pos_logits, jnp.ones_like(pos_logits))
+
+    k_pi, k_noise, k_rand = jax.random.split(key, 3)
+    pi_action, _ = wm.pi(params, z_flat, k_pi, spec, task=task_flat)
+    noisy_action = jnp.clip(
+        pi_action
+        + spec.contrastive_neg_noise * jax.random.normal(k_noise, pi_action.shape),
+        -1.0,
+        1.0,
+    )
+    random_action = jax.random.uniform(k_rand, pi_action.shape, minval=-1.0, maxval=1.0)
+    candidates = jnp.stack(
+        [
+            jax.lax.stop_gradient(pi_action),
+            jax.lax.stop_gradient(noisy_action),
+            random_action,
+        ],
+        axis=1,
+    )
+    z_candidates = jnp.repeat(z_flat[:, None, :], candidates.shape[1], axis=1)
+    candidate_logits = wm.contrastive_f(
+        params,
+        jnp.reshape(z_candidates, (-1, z_flat.shape[-1])),
+        jnp.reshape(candidates, (-1, candidates.shape[-1])),
+        spec,
+        task=(
+            jnp.repeat(task_flat, candidates.shape[1])
+            if task_flat is not None
+            else None
+        ),
+    )
+    candidate_logits = jnp.reshape(candidate_logits, (-1, candidates.shape[1], 1))
+    hard_idx = jnp.argmax(jax.lax.stop_gradient(candidate_logits[..., 0]), axis=1)
+    hard_neg = candidates[jnp.arange(candidates.shape[0]), hard_idx]
+    neg_logits = wm.contrastive_f(params, z_flat, hard_neg, spec, task=task_flat)
+    neg_loss = jm.bce_with_logits(neg_logits, jnp.zeros_like(neg_logits))
+    loss = 0.5 * (jnp.mean(pos_loss) + jnp.mean(neg_loss))
+    scores = jnp.concatenate([pos_logits, neg_logits], axis=0)
+    return loss, scores
+
+
+def _mc_score_target(
+    params,
+    z0,
+    task,
+    key,
+    spec: wm.ModelSpec,
+    contrastive_mean,
+    contrastive_std,
+):
+    num_samples = int(spec.diffusion_num_samples_mf)
+    num_steps = max(spec.diffusion_steps, 2)
+    k_tau, k_x, k_samples, k_value = jax.random.split(key, 4)
+    betas = jnp.linspace(spec.diffusion_beta0, spec.diffusion_betaT, num_steps)
+    alphas = 1.0 - betas
+    alpha_bar = jnp.cumprod(alphas)
+    tau = jax.random.randint(k_tau, (1,), 1, num_steps)
+    alpha_bar_tau = alpha_bar[tau[0]]
+    x_tau = jax.random.normal(k_x, (spec.horizon, spec.action_dim), dtype=z0.dtype)
+    mean_cond = x_tau / jnp.sqrt(alpha_bar_tau)
+    std_cond = jnp.sqrt((1.0 - alpha_bar_tau) / alpha_bar_tau)
+    a0_samples = jnp.clip(
+        mean_cond[None]
+        + std_cond
+        * jax.random.normal(
+            k_samples, (num_samples, spec.horizon, spec.action_dim), dtype=z0.dtype
+        ),
+        -1.0,
+        1.0,
+    )
+    values = _estimate_value(
+        params,
+        jnp.repeat(z0, num_samples, axis=0),
+        jnp.swapaxes(a0_samples, 0, 1),
+        spec,
+        contrastive_mean,
+        contrastive_std,
+        k_value,
+        task=task,
+    )
+    values = jnp.reshape(jnp.nan_to_num(values, nan=0.0), (num_samples, -1)).mean(
+        axis=-1
+    )
+    logits = (values - jnp.mean(values)) / (jnp.std(values, ddof=1) + 1e-6)
+    weights = jax.nn.softmax(logits / max(spec.diffusion_temperature, 1e-6), axis=0)
+    a_bar = jnp.sum(weights[:, None, None] * a0_samples, axis=0)
+    target_score = (-x_tau + jnp.sqrt(alpha_bar_tau) * a_bar) / (
+        1.0 - alpha_bar_tau + 1e-8
+    )
+    return x_tau, tau, target_score
+
+
+def _termination_statistics(pred, target):
+    pred = jnp.squeeze(pred, axis=-1)
+    target = jnp.squeeze(target, axis=-1)
+    rate = jnp.mean(target)
+    tp = jnp.sum((pred > 0.5) & (target == 1.0))
+    fn = jnp.sum((pred <= 0.5) & (target == 1.0))
+    fp = jnp.sum((pred > 0.5) & (target == 0.0))
+    recall = tp / (tp + fn + 1e-9)
+    precision = tp / (tp + fp + 1e-9)
+    f1 = 2.0 * (precision * recall) / (precision + recall + 1e-9)
+    return rate, f1
+
+
+def _make_train_step(spec: wm.ModelSpec, model_tx, pi_tx):
+    rho = jnp.power(spec.rho, jnp.arange(spec.horizon, dtype=jnp.float32))
+    pi_rho = jnp.power(spec.rho, jnp.arange(spec.horizon + 1, dtype=jnp.float32))
+
+    @functools.partial(jax.jit, donate_argnums=(0,))
+    def train_step(state, batch):
+        key, k_encode_next, k_encode_z0, k_td, k_q, k_contrast, k_pi_loss, k_score = jax.random.split(
+            state["key"], 8
+        )
+        shared_key, k_pi_q = jax.random.split(state["shared_key"], 2)
+        obs = batch["obs"]
+        action = batch["action"]
+        reward = batch["reward"]
+        terminated = batch["terminated"]
+        task = batch.get("task", None)
+
+        def model_loss_fn(params):
+            next_z = jax.lax.stop_gradient(
+                wm.encode(params, obs[1:], spec, task=task, key=k_encode_next)
+            )
+            target_action, _ = wm.pi(params, next_z, k_td, spec, task=task)
+            target_z = wm.task_emb(params, next_z, task, spec)
+            target_qs = wm.q_all_from_qs(
+                state["target_qs"], target_z, target_action, spec, train=False
+            )
+            target_q_values = jm.two_hot_inv(
+                target_qs, spec.num_bins, spec.vmin, spec.vmax
+            )
+            target_q = jnp.min(target_q_values[:2], axis=0)
+            td_targets = jax.lax.stop_gradient(
+                reward + wm.discount(task, spec, reward) * (1.0 - terminated) * target_q
+            )
+
+            z0 = wm.encode(params, obs[0], spec, task=task, key=k_encode_z0)
+
+            def rollout_body(z_t, scan_in):
+                action_t, next_z_t = scan_in
+                z_next = wm.next_latent(params, z_t, action_t, spec, task=task)
+                loss_t = jnp.mean(jnp.square(z_next - next_z_t))
+                return z_next, (z_next, loss_t)
+
+            _, (pred_zs, consistency_per_t) = jax.lax.scan(
+                rollout_body, z0, (action, next_z)
+            )
+            zs = jnp.concatenate([z0[None], pred_zs], axis=0)
+            model_zs = zs[:-1]
+
+            reward_pred = wm.reward(params, model_zs, action, spec, task=task)
+            qs = wm.q_all(params, model_zs, action, spec, key=k_q, train=True, task=task)
+            termination_pred = (
+                wm.termination(params, zs[1:], spec, task=task, unnormalized=True)
+                if spec.episodic
+                else jnp.zeros_like(terminated)
+            )
+
+            consistency_loss = jnp.sum(consistency_per_t * rho) / spec.horizon
+            reward_loss = (
+                jnp.sum(
+                    jnp.mean(
+                        jm.soft_ce(
+                            reward_pred,
+                            reward,
+                            spec.num_bins,
+                            spec.vmin,
+                            spec.vmax,
+                            spec.bin_size,
+                        ),
+                        axis=(1, 2),
+                    )
+                    * rho
+                )
+                / spec.horizon
+            )
+            value_ce = jm.soft_ce(
+                qs,
+                td_targets[None],
+                spec.num_bins,
+                spec.vmin,
+                spec.vmax,
+                spec.bin_size,
+            )
+            value_loss = (
+                jnp.sum(jnp.mean(value_ce, axis=(2, 3)) * rho[None, :])
+                / (spec.horizon * spec.num_q)
+            )
+            contrastive_loss, contrastive_scores = _contrastive_loss(
+                params, model_zs, action, k_contrast, spec, task=task
+            )
+            termination_loss = (
+                jnp.mean(jm.bce_with_logits(termination_pred, terminated))
+                if spec.episodic
+                else jnp.zeros((), dtype=reward.dtype)
+            )
+            total_loss = (
+                spec.consistency_coef * consistency_loss
+                + spec.reward_coef * reward_loss
+                + spec.termination_coef * termination_loss
+                + spec.value_coef * value_loss
+                + spec.contrastive_coef * contrastive_loss
+            )
+            score_loss = jnp.zeros((), dtype=reward.dtype)
+            if spec.use_score_network:
+                score_task = (
+                    jnp.reshape(task, (-1,))[:1] if task is not None else None
+                )
+                x_tau, tau_idx, target_score = _mc_score_target(
+                    params,
+                    zs[0, 0:1],
+                    score_task,
+                    k_score,
+                    spec,
+                    state["contrastive_mean"],
+                    state["contrastive_std"],
+                )
+                pred_score = wm.score(
+                    params,
+                    zs[0, 0:1],
+                    x_tau[None],
+                    tau_idx,
+                    spec,
+                    task=score_task,
+                )[0]
+                score_loss = jnp.mean(jnp.square(pred_score - jax.lax.stop_gradient(target_score)))
+                total_loss = total_loss + spec.score_loss_coef * score_loss
+            aux = {
+                "zs": jax.lax.stop_gradient(zs),
+                "consistency_loss": consistency_loss,
+                "reward_loss": reward_loss,
+                "value_loss": value_loss,
+                "contrastive_loss": contrastive_loss,
+                "termination_loss": termination_loss,
+                "score_loss": score_loss,
+                "total_loss": total_loss,
+                "contrastive_scores": jax.lax.stop_gradient(contrastive_scores),
+                "termination_pred": jax.lax.stop_gradient(termination_pred),
+            }
+            return total_loss, aux
+
+        (model_loss, aux), model_grads = jax.value_and_grad(
+            model_loss_fn, has_aux=True
+        )(state["params"])
+        model_grads = dict(model_grads)
+        model_grads["pi"] = _zeros_like_tree(model_grads["pi"])
+        model_grad_norm = _global_norm(model_grads)
+        model_updates, model_opt_state = model_tx.update(
+            model_grads, state["model_opt"], state["params"]
+        )
+        params = wm.clip_task_embeddings(
+            optax.apply_updates(state["params"], model_updates), spec
+        )
+
+        scores = aux["contrastive_scores"]
+        batch_mean = jnp.mean(scores)
+        batch_std = jnp.maximum(jnp.std(scores), 1e-6)
+        contrastive_mean = (
+            state["contrastive_mean"] * spec.contrastive_momentum
+            + batch_mean * (1.0 - spec.contrastive_momentum)
+        )
+        contrastive_std = (
+            state["contrastive_std"] * spec.contrastive_momentum
+            + batch_std * (1.0 - spec.contrastive_momentum)
+        )
+
+        def pi_loss_fn(pi_params):
+            params_for_pi = dict(params)
+            params_for_pi["pi"] = pi_params
+            pi_action, pi_info = wm.pi(
+                params_for_pi, aux["zs"], k_pi_loss, spec, task=task
+            )
+            qs = wm.q_value(
+                params_for_pi, aux["zs"], pi_action, spec, "avg", key=k_pi_q, task=task
+            )
+            new_scale = state["scale"] + spec.tau * (_percentile_scale(qs[0]) - state["scale"])
+            scaled_qs = qs / new_scale
+            loss = -jnp.mean(
+                jnp.mean(spec.entropy_coef * pi_info["scaled_entropy"] + scaled_qs, axis=(1, 2))
+                * pi_rho
+            )
+            pi_aux = {
+                "pi_entropy": jnp.mean(pi_info["entropy"]),
+                "pi_scaled_entropy": jnp.mean(pi_info["scaled_entropy"]),
+                "pi_scale": jnp.mean(new_scale),
+                "new_scale": new_scale,
+            }
+            return loss, pi_aux
+
+        (pi_loss, pi_aux), pi_grads = jax.value_and_grad(pi_loss_fn, has_aux=True)(
+            params["pi"]
+        )
+        pi_grad_norm = _global_norm(pi_grads)
+        pi_updates, pi_opt_state = pi_tx.update(pi_grads, state["pi_opt"], params["pi"])
+        params = dict(params)
+        params["pi"] = optax.apply_updates(params["pi"], pi_updates)
+
+        target_qs = jax.tree_util.tree_map(
+            lambda target, online: target + spec.tau * (online - target),
+            state["target_qs"],
+            params["qs"],
+        )
+        new_state = {
+            "params": params,
+            "target_qs": target_qs,
+            "model_opt": model_opt_state,
+            "pi_opt": pi_opt_state,
+            "key": key,
+            "shared_key": shared_key,
+            "prev_mean": state["prev_mean"],
+            "contrastive_mean": contrastive_mean,
+            "contrastive_std": contrastive_std,
+            "scale": pi_aux["new_scale"],
+        }
+        metrics = {
+            "consistency_loss": aux["consistency_loss"],
+            "reward_loss": aux["reward_loss"],
+            "value_loss": aux["value_loss"],
+            "contrastive_loss": aux["contrastive_loss"],
+            "termination_loss": aux["termination_loss"],
+            "score_loss": aux["score_loss"],
+            "total_loss": model_loss,
+            "grad_norm": model_grad_norm,
+            "pi_loss": pi_loss,
+            "pi_grad_norm": pi_grad_norm,
+            "pi_entropy": pi_aux["pi_entropy"],
+            "pi_scaled_entropy": pi_aux["pi_scaled_entropy"],
+            "pi_scale": pi_aux["pi_scale"],
+        }
+        if spec.episodic:
+            termination_rate, termination_f1 = _termination_statistics(
+                jax.nn.sigmoid(aux["termination_pred"][-1]), terminated[-1]
+            )
+            metrics["termination_rate"] = termination_rate
+            metrics["termination_f1"] = termination_f1
+        return new_state, metrics
+
+    return train_step
+
+
+class MBDPO:
+    """JAX MBDPO implementation for state/rgb observations."""
 
     def __init__(self, cfg):
-        super().__init__()
+        if cfg.obs not in {"state", "rgb"}:
+            raise ValueError("JAX implementation supports state and rgb observations only.")
+
         self.cfg = cfg
-        self.device = torch.device("cuda:0")
-        self.model = WorldModel(cfg).to(self.device)
-        self.optim = torch.optim.Adam(
-            [
-                {
-                    "params": self.model._encoder.parameters(),
-                    "lr": self.cfg.lr * self.cfg.enc_lr_scale,
-                },
-                {"params": self.model._dynamics.parameters()},
-                {"params": self.model._reward.parameters()},
-                {
-                    "params": (
-                        self.model._termination.parameters()
-                        if self.cfg.episodic
-                        else []
-                    )
-                },
-                {"params": self.model._F.parameters()},
-                {"params": self.model._score.parameters()},
-                {"params": self.model._Qs.parameters()},
-                {
-                    "params": (
-                        self.model._task_emb.parameters() if self.cfg.multitask else []
-                    )
-                },
-            ],
-            lr=self.cfg.lr,
-            capturable=True,
+        self.spec = wm.spec_from_cfg(cfg)
+        key = jax.random.PRNGKey(int(cfg.seed))
+        key, init_key = jax.random.split(key)
+        key, shared_key = jax.random.split(key)
+        params = wm.init_params(init_key, self.spec)
+        self.model_tx = make_model_tx(self.spec, params)
+        self.pi_tx = optax.chain(
+            optax.clip_by_global_norm(self.spec.grad_clip_norm),
+            optax.adam(self.spec.lr, eps=1e-5),
         )
-        self.pi_optim = torch.optim.Adam(
-            self.model._pi.parameters(), lr=self.cfg.lr, eps=1e-5, capturable=True
-        )
-        self.model.eval()
-        self.scale = RunningScale(cfg)
-        self._compile_mode = str(
-            getattr(cfg, "compile_mode", "max-autotune-no-cudagraphs")
-        )
-        self._contrastive_eta = float(getattr(cfg, "contrastive_eta", 0.01))
-        self._contrastive_coef = float(getattr(cfg, "contrastive_coef", 1.0))
-        self._contrastive_clip = float(getattr(cfg, "contrastive_clip", 5.0))
-        self._contrastive_momentum = float(getattr(cfg, "contrastive_momentum", 0.99))
-        self.register_buffer("_contrastive_mean", torch.zeros(1, device=self.device))
-        self.register_buffer("_contrastive_std", torch.ones(1, device=self.device))
-        self.discount = (
-            torch.tensor(
-                [self._get_discount(ep_len) for ep_len in cfg.episode_lengths],
-                device="cuda:0",
-            )
-            if self.cfg.multitask
-            else self._get_discount(cfg.episode_length)
-        )
-        print("Episode length:", cfg.episode_length)
-        print("Discount factor:", self.discount)
-        self._prev_mean = torch.nn.Buffer(
-            torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device)
-        )
-        self._diffusion_planner = Diffusion(cfg)
-        self._compiled_update_core = self._update_core
-        if cfg.compile:
-            print(
-                f"Compiling update core with torch.compile (mode={self._compile_mode})..."
-            )
-            self._compiled_update_core = torch.compile(
-                self._update_core, mode=self._compile_mode
-            )
+        self.state = {
+            "params": params,
+            "target_qs": jax.tree_util.tree_map(lambda x: x.copy(), params["qs"]),
+            "model_opt": self.model_tx.init(params),
+            "pi_opt": self.pi_tx.init(params["pi"]),
+            "key": key,
+            "shared_key": shared_key,
+            "prev_mean": jnp.zeros(
+                (self.spec.horizon, self.spec.action_dim), dtype=jnp.float32
+            ),
+            "contrastive_mean": jnp.zeros((1,), dtype=jnp.float32),
+            "contrastive_std": jnp.ones((1,), dtype=jnp.float32),
+            "scale": jnp.ones((1,), dtype=jnp.float32),
+        }
+        self._train_step = _make_train_step(self.spec, self.model_tx, self.pi_tx)
+        self._plan_step = make_plan_step(self.spec, _estimate_value)
 
-    @property
-    def plan(self):
-        _plan_val = getattr(self, "_plan_val", None)
-        if _plan_val is not None:
-            return _plan_val
-        plan = self._diffusion_plan
-        self._plan_val = plan
-        return self._plan_val
-
-    def _diffusion_plan(self, obs, t0=False, eval_mode=False, task=None):
-        return self._diffusion_planner.plan(
-            self, obs, t0=t0, eval_mode=eval_mode, task=task
+    def act(self, obs, t0=False, eval_mode=False, task=None):
+        obs = np.asarray(obs, dtype=np.float32)
+        task_value = 0 if task is None else int(np.asarray(task).reshape(-1)[0])
+        action, prev_mean, key = self._plan_step(
+            self.state["params"],
+            self.state["prev_mean"],
+            self.state["key"],
+            jnp.asarray(obs),
+            jnp.asarray(bool(t0)),
+            jnp.asarray(bool(eval_mode)),
+            self.state["contrastive_mean"],
+            self.state["contrastive_std"],
+            jnp.asarray(task_value, dtype=jnp.int32),
         )
+        self.state["prev_mean"] = prev_mean
+        self.state["key"] = key
+        return np.asarray(jax.device_get(action), dtype=np.float32)
 
-    def _get_discount(self, episode_length):
-        """Return a heuristic discount factor for a fixed episode length.
-
-        Parameters
-        ----------
-        episode_length : int
-            Episode length for the current task.
-
-        Returns
-        -------
-        float
-            Discount factor clipped to the configured range.
-        """
-        frac = episode_length / self.cfg.discount_denom
-        return min(
-            max((frac - 1) / (frac), self.cfg.discount_min), self.cfg.discount_max
-        )
+    def update(self, batch: Dict[str, np.ndarray]):
+        jax_batch = {}
+        for k, v in batch.items():
+            dtype = jnp.int32 if k == "task" else jnp.float32
+            jax_batch[k] = jnp.asarray(v, dtype=dtype)
+        self.state, metrics = self._train_step(self.state, jax_batch)
+        return {k: float(np.asarray(jax.device_get(v))) for k, v in metrics.items()}
 
     def save(self, fp):
-        """Save the agent state dictionary.
-
-        Parameters
-        ----------
-        fp : str
-            Target file path.
-        """
-        torch.save({"model": self.model.state_dict()}, fp)
+        payload = {
+            "state": jax.device_get(self.state),
+            "spec": self.spec,
+        }
+        with open(fp, "wb") as f:
+            pickle.dump(payload, f)
 
     def load(self, fp):
-        """Load a model state dictionary into the current agent.
-
-        Parameters
-        ----------
-        fp : str or dict
-            File path to a checkpoint, or an already loaded state dictionary.
-        """
-        if isinstance(fp, dict):
-            state_dict = fp
-        else:
-            state_dict = torch.load(
-                fp, map_location=torch.get_default_device(), weights_only=False
-            )
-        state_dict = state_dict["model"] if "model" in state_dict else state_dict
-        state_dict = api_model_conversion(self.model.state_dict(), state_dict)
-        missing_keys, unexpected_keys = self.model.load_state_dict(
-            state_dict, strict=False
-        )
-
-        # Backward compatibility: `_G` was removed from the world model.
-        allowed_missing_g_keys = tuple(
-            key for key in missing_keys if key.startswith("_G.")
-        )
-        missing_keys = [
-            key for key in missing_keys if key not in allowed_missing_g_keys
-        ]
-        allowed_unexpected_g_keys = tuple(
-            key for key in unexpected_keys if key.startswith("_G.")
-        )
-        unexpected_keys = [
-            key for key in unexpected_keys if key not in allowed_unexpected_g_keys
-        ]
-        allowed_f_keys = tuple(key for key in missing_keys if key.startswith("_F."))
-        missing_keys = [key for key in missing_keys if key not in allowed_f_keys]
-        allowed_missing_score_keys = tuple(
-            key for key in missing_keys if key.startswith("_score.")
-        )
-        missing_keys = [
-            key for key in missing_keys if key not in allowed_missing_score_keys
-        ]
-
-        if missing_keys or unexpected_keys:
-            pieces = []
-            if missing_keys:
-                pieces.append(f"Missing key(s) in state_dict: {missing_keys}")
-            if unexpected_keys:
-                pieces.append(f"Unexpected key(s) in state_dict: {unexpected_keys}")
-            extra = ""
-            if allowed_missing_g_keys or allowed_unexpected_g_keys:
-                extra = " Legacy checkpoint note: `_G` weights were ignored because `_G` is no longer part of WorldModel."
-            raise RuntimeError(
-                "Error(s) in loading state_dict for WorldModel: "
-                + "; ".join(pieces)
-                + extra
-            )
-        if allowed_missing_score_keys:
-            self.cfg.use_score_network = False
-            self.cfg.score_only_inference = False
-            for module in self.model._score.modules():
-                if isinstance(module, torch.nn.Linear):
-                    torch.nn.init.kaiming_normal_(
-                        module.weight, mode="fan_in", nonlinearity="relu"
-                    )
-                    if module.bias is not None:
-                        torch.nn.init.zeros_(module.bias)
-        else:
-            self.cfg.use_score_network = bool(
-                getattr(self.cfg, "use_score_network", True)
-            )
-            self.cfg.score_only_inference = self.cfg.use_score_network
-        return
-
-    @torch.no_grad()
-    def act(self, obs, t0=False, eval_mode=False, task=None):
-        """Select an action by latent-space planning.
-
-        Parameters
-        ----------
-        obs : torch.Tensor
-            Observation from the environment.
-        t0 : bool, default=False
-            Whether this is the first step of the episode.
-        eval_mode : bool, default=False
-            Whether to use deterministic action selection.
-        task : int or None, default=None
-            Optional task index for multitask settings.
-
-        Returns
-        -------
-        torch.Tensor
-            Action to apply in the environment.
-        """
-        obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
-        if task is not None:
-            task = torch.tensor([task], device=self.device)
-        return self.plan(obs, t0=t0, eval_mode=eval_mode, task=task).cpu()
-
-    @torch.no_grad()
-    def act_policy(self, obs, eval_mode=True, task=None):
-        """Return policy-network action for a single observation."""
-        obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
-        if task is not None and not torch.is_tensor(task):
-            task = torch.tensor([task], device=self.device)
-        z = self.model.encode(obs, task)
-        action, info = self.model.pi(z, task)
-        if eval_mode:
-            action = info["mean"]
-        return action[0].clamp(-1, 1).cpu()
-
-    @torch.no_grad()
-    def act_diffusion(self, obs, t0=False, eval_mode=True, task=None):
-        """Return diffusion planner action for a single observation."""
-        obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
-        if task is not None and not torch.is_tensor(task):
-            task = torch.tensor([task], device=self.device)
-        return (
-            self._diffusion_plan(obs, t0=t0, eval_mode=eval_mode, task=task)
-            .clamp(-1, 1)
-            .cpu()
-        )
-
-    @torch.no_grad()
-    def _estimate_value(self, z, actions, task):
-        """Estimate value of a trajectory starting at latent state z and executing given actions."""
-        G, discount = 0, 1
-        num_samples = actions.shape[1]
-        termination = torch.zeros(num_samples, 1, dtype=torch.float32, device=z.device)
-        for t in range(self.cfg.horizon):
-            reward = math.two_hot_inv(self.model.reward(z, actions[t], task), self.cfg)
-            f_score = self.model.F(z, actions[t], task)
-            f_norm = self._normalize_contrastive_score(f_score)
-            shaped_reward = reward + self._contrastive_eta * f_norm
-            z = self.model.next(z, actions[t], task)
-            G = G + discount * (1 - termination) * shaped_reward
-            if self.cfg.multitask:
-                task_idx = task
-                if torch.is_tensor(task_idx):
-                    task_idx = task_idx.reshape(-1)[0]
-                discount_update = self.discount[
-                    task_idx.long() if torch.is_tensor(task_idx) else int(task_idx)
-                ]
-            else:
-                discount_update = self.discount
-            discount = discount * discount_update
-            if self.cfg.episodic:
-                termination = torch.clip(
-                    termination + (self.model.termination(z, task) > 0.5).float(),
-                    max=1.0,
-                )
-        action, _ = self.model.pi(z, task)
-        return G + discount * (1 - termination) * self.model.Q(
-            z, action, task, return_type="avg"
-        )
-
-    def _normalize_contrastive_score(self, score):
-        std = torch.clamp(self._contrastive_std, min=1e-6)
-        normed = (score - self._contrastive_mean) / std
-        return normed.clamp(-self._contrastive_clip, self._contrastive_clip)
-
-    @torch.no_grad()
-    def _update_contrastive_stats(self, scores):
-        batch_mean = scores.mean()
-        batch_std = scores.std(unbiased=False)
-        batch_std = torch.clamp(batch_std, min=1e-6)
-        self._contrastive_mean.mul_(self._contrastive_momentum).add_(
-            batch_mean * (1 - self._contrastive_momentum)
-        )
-        self._contrastive_std.mul_(self._contrastive_momentum).add_(
-            batch_std * (1 - self._contrastive_momentum)
-        )
-
-    @torch.no_grad()
-    def _mc_score_target(self, z0, task):
-        num_samples = int(getattr(self.cfg, "diffusion_num_samples_mf", 64))
-        num_steps = max(int(self.cfg.diffusion_steps), 2)
-        betas = torch.linspace(
-            self.cfg.diffusion_beta0,
-            self.cfg.diffusion_betaT,
-            num_steps,
-            device=z0.device,
-        )
-        alphas = 1.0 - betas
-        alpha_bar = torch.cumprod(alphas, dim=0)
-        tau = torch.randint(1, num_steps, (1,), device=z0.device)
-        alpha_bar_tau = alpha_bar[tau].squeeze(0)
-        x_tau = torch.randn(self.cfg.horizon, self.cfg.action_dim, device=z0.device)
-        mean_cond = x_tau / torch.sqrt(alpha_bar_tau)
-        std_cond = torch.sqrt((1.0 - alpha_bar_tau) / alpha_bar_tau)
-        a0_samples = (
-            mean_cond.unsqueeze(0)
-            + std_cond
-            * torch.randn(
-                num_samples, self.cfg.horizon, self.cfg.action_dim, device=z0.device
-            )
-        ).clamp(-1, 1)
-        actions_for_value = a0_samples.permute(1, 0, 2)
-        task_for_samples = (
-            task.reshape(-1)[:1]
-            if (task is not None and torch.is_tensor(task))
-            else task
-        )
-        values = self._estimate_value(
-            z0.repeat(num_samples, 1), actions_for_value, task_for_samples
-        ).nan_to_num(0.0)
-        values = values.reshape(num_samples, -1).mean(dim=-1)
-        logits = (values - values.mean()) / (values.std() + 1e-6)
-        weights = torch.softmax(
-            logits / max(float(self.cfg.diffusion_temperature), 1e-6), dim=0
-        )
-        a_bar = (weights[:, None, None] * a0_samples).sum(dim=0)
-        target_score = (-x_tau + torch.sqrt(alpha_bar_tau) * a_bar) / (
-            1.0 - alpha_bar_tau + 1e-8
-        )
-        return x_tau, tau, target_score
-
-    def _contrastive_loss(self, zs, actions, task):
-        """
-        Binary contrastive objective: buffer actions as positives and model-generated actions as hard negatives.
-        """
-        z_flat = zs.reshape(-1, zs.shape[-1]).detach()
-        a_pos = actions.permute(1, 0, 2).reshape(-1, actions.shape[-1])
-        task_flat = None
-        if task is not None:
-            task_flat = task.long().reshape(-1).repeat_interleave(self.cfg.horizon)
-
-        pos_logits = self.model.F(z_flat, a_pos, task_flat)
-        labels_pos = torch.ones_like(pos_logits)
-
-        with torch.no_grad():
-            pi_action, _ = self.model.pi(z_flat, task_flat)
-            noise_scale = float(getattr(self.cfg, "contrastive_neg_noise", 0.5))
-            noisy_action = (
-                pi_action + noise_scale * torch.randn_like(pi_action)
-            ).clamp(-1, 1)
-            random_action = (2.0 * torch.rand_like(pi_action) - 1.0).clamp(-1, 1)
-            candidate_actions = torch.stack(
-                [pi_action, noisy_action, random_action], dim=1
-            )
-            candidate_logits = (
-                self.model.F(
-                    z_flat.unsqueeze(1)
-                    .expand(-1, candidate_actions.shape[1], -1)
-                    .reshape(-1, z_flat.shape[-1]),
-                    candidate_actions.reshape(-1, candidate_actions.shape[-1]),
-                    (
-                        task_flat.repeat_interleave(candidate_actions.shape[1])
-                        if task_flat is not None
-                        else None
-                    ),
-                )
-                .reshape(-1, candidate_actions.shape[1], 1)
-                .squeeze(-1)
-            )
-            hard_idx = candidate_logits.argmax(dim=1)
-            hard_neg = candidate_actions[
-                torch.arange(candidate_actions.shape[0], device=hard_idx.device),
-                hard_idx,
-            ]
-
-        neg_logits = self.model.F(z_flat, hard_neg, task_flat)
-        labels_neg = torch.zeros_like(neg_logits)
-
-        loss_pos = F.binary_cross_entropy_with_logits(pos_logits, labels_pos)
-        loss_neg = F.binary_cross_entropy_with_logits(neg_logits, labels_neg)
-        self._update_contrastive_stats(
-            torch.cat([pos_logits.detach(), neg_logits.detach()], dim=0)
-        )
-        return 0.5 * (loss_pos + loss_neg)
-
-    @torch.no_grad()
-    def _plan(self, obs, t0=False, eval_mode=False, task=None):
-        """Plan an action sequence with MPPI in latent space.
-
-        Parameters
-        ----------
-        obs : torch.Tensor
-            Observation tensor used to initialize planning.
-        t0 : bool, default=False
-            Whether this is the first step of the episode.
-        eval_mode : bool, default=False
-            Whether to skip exploratory action noise.
-        task : torch.Tensor or None, default=None
-            Optional task index for multitask settings.
-
-        Returns
-        -------
-        torch.Tensor
-            First action of the selected elite sequence.
-        """
-        # Sample policy trajectories
-        z0 = self.model.encode(obs, task)
-        z = z0
-        if self.cfg.num_pi_trajs > 0:
-            pi_actions = torch.empty(
-                self.cfg.horizon,
-                self.cfg.num_pi_trajs,
-                self.cfg.action_dim,
-                device=self.device,
-            )
-            _z = z.repeat(self.cfg.num_pi_trajs, 1)
-            for t in range(self.cfg.horizon - 1):
-                pi_actions[t], _ = self.model.pi(_z, task)
-                _z = self.model.next(_z, pi_actions[t], task)
-            pi_actions[-1], _ = self.model.pi(_z, task)
-
-        # Initialize state and parameters
-        z = z.repeat(self.cfg.num_samples, 1)
-        mean = torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device)
-        std = torch.full(
-            (self.cfg.horizon, self.cfg.action_dim),
-            self.cfg.max_std,
-            dtype=torch.float,
-            device=self.device,
-        )
-        if not t0:
-            mean[:-1] = self._prev_mean[1:]
-        actions = torch.empty(
-            self.cfg.horizon,
-            self.cfg.num_samples,
-            self.cfg.action_dim,
-            device=self.device,
-        )
-        if self.cfg.num_pi_trajs > 0:
-            actions[:, : self.cfg.num_pi_trajs] = pi_actions
-
-        # Iterate MPPI
-        for _ in range(self.cfg.iterations):
-
-            # Sample actions
-            r = torch.randn(
-                self.cfg.horizon,
-                self.cfg.num_samples - self.cfg.num_pi_trajs,
-                self.cfg.action_dim,
-                device=std.device,
-            )
-            actions_sample = mean.unsqueeze(1) + std.unsqueeze(1) * r
-            actions_sample = actions_sample.clamp(-1, 1)
-            actions[:, self.cfg.num_pi_trajs :] = actions_sample
-            if self.cfg.multitask:
-                actions = actions * self.model._action_masks[task]
-
-            # Compute elite actions
-            value = self._estimate_value(z, actions, task).nan_to_num(0)
-            elite_idxs = torch.topk(
-                value.squeeze(1), self.cfg.num_elites, dim=0
-            ).indices
-            elite_value, elite_actions = value[elite_idxs], actions[:, elite_idxs]
-
-            # Update parameters
-            max_value = elite_value.max(0).values
-            score = torch.exp(self.cfg.temperature * (elite_value - max_value))
-            score = score / score.sum(0)
-            mean = (score.unsqueeze(0) * elite_actions).sum(dim=1) / (
-                score.sum(0) + 1e-9
-            )
-            std = (
-                (score.unsqueeze(0) * (elite_actions - mean.unsqueeze(1)) ** 2).sum(
-                    dim=1
-                )
-                / (score.sum(0) + 1e-9)
-            ).sqrt()
-            std = std.clamp(self.cfg.min_std, self.cfg.max_std)
-            if self.cfg.multitask:
-                mean = mean * self.model._action_masks[task]
-                std = std * self.model._action_masks[task]
-
-        # Select action
-        rand_idx = math.gumbel_softmax_sample(score.squeeze(1))
-        actions = torch.index_select(elite_actions, 1, rand_idx).squeeze(1)
-        a, std = actions[0], std[0]
-        if not eval_mode:
-            a = a + std * torch.randn(self.cfg.action_dim, device=std.device)
-        self._prev_mean.copy_(mean)
-        if bool(getattr(self.cfg, "save_trajectory", False)):
-            z_curr = z0[:1]
-            z_roll = [z_curr]
-            for imagine_step in range(self.cfg.horizon):
-                z_curr = self.model.next(
-                    z_curr, mean[imagine_step : imagine_step + 1], task
-                )
-                z_roll.append(z_curr)
-            self._last_imagined_z_traj = torch.cat(z_roll, dim=0).detach()
-        else:
-            self._last_imagined_z_traj = None
-        return a.clamp(-1, 1)
-
-    def update_pi(self, zs, task):
-        """Update the policy network from latent trajectories.
-
-        Parameters
-        ----------
-        zs : torch.Tensor
-            Sequence of latent states.
-        task : torch.Tensor or None
-            Optional task index for multitask settings.
-
-        Returns
-        -------
-        TensorDict
-            Training statistics for the policy update step.
-        """
-        action, info = self.model.pi(zs, task)
-        qs = self.model.Q(zs, action, task, return_type="avg", detach=True)
-        self.scale.update(qs[0])
-        qs = self.scale(qs)
-
-        # Loss is a weighted sum of Q-values
-        rho = torch.pow(self.cfg.rho, torch.arange(len(qs), device=self.device))
-        pi_loss = (
-            -(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1, 2))
-            * rho
-        ).mean()
-        pi_loss.backward()
-        pi_grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model._pi.parameters(), self.cfg.grad_clip_norm
-        )
-        self.pi_optim.step()
-        self.pi_optim.zero_grad(set_to_none=True)
-
-        info = TensorDict(
-            {
-                "pi_loss": pi_loss,
-                "pi_grad_norm": pi_grad_norm,
-                "pi_entropy": info["entropy"],
-                "pi_scaled_entropy": info["scaled_entropy"],
-                "pi_scale": self.scale.value,
-            }
-        )
-        return info
-
-    @torch.no_grad()
-    def _td_target(self, next_z, reward, terminated, task):
-        """Compute TD targets for critic updates.
-
-        Parameters
-        ----------
-        next_z : torch.Tensor
-            Latent state at the next time step.
-        reward : torch.Tensor
-            Immediate reward at the current time step.
-        terminated : torch.Tensor
-            Episode termination flag.
-        task : torch.Tensor or None
-            Optional task index for multitask settings.
-
-        Returns
-        -------
-        torch.Tensor
-            Bootstrapped TD target values.
-        """
-        action, _ = self.model.pi(next_z, task)
-        discount = (
-            self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
-        )
-        target_qs = self.model.Q(next_z, action, task, return_type="all", target=True)
-        target_q = math.two_hot_inv(target_qs[:2], self.cfg).min(0).values
-        return reward + discount * (1 - terminated) * target_q
-
-    def _update_core(self, obs, action, reward, terminated, task=None):
-        with torch.no_grad():
-            next_z = self.model.encode(obs[1:], task)
-            td_targets = self._td_target(next_z, reward, terminated, task)
-
-        zs = torch.empty(
-            self.cfg.horizon + 1,
-            self.cfg.batch_size,
-            self.cfg.latent_dim,
-            device=self.device,
-        )
-        z = self.model.encode(obs[0], task)
-        zs[0] = z
-        consistency_loss = 0
-        for t, (_action, _next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):
-            z = self.model.next(z, _action, task)
-            consistency_loss = (
-                consistency_loss + F.mse_loss(z, _next_z) * self.cfg.rho**t
-            )
-            zs[t + 1] = z
-
-        _zs = zs[:-1]
-        qs = self.model.Q(_zs, action, task, return_type="all")
-        reward_preds = self.model.reward(_zs, action, task)
-        termination_pred = (
-            self.model.termination(zs[1:], task, unnormalized=True)
-            if self.cfg.episodic
-            else None
-        )
-
-        reward_loss, value_loss = 0, 0
-        contrastive_loss = self._contrastive_loss(_zs, action, task)
-        for t, (rew_pred_unbind, rew_unbind, td_targets_unbind, qs_unbind) in enumerate(
-            zip(
-                reward_preds.unbind(0),
-                reward.unbind(0),
-                td_targets.unbind(0),
-                qs.unbind(1),
-            )
-        ):
-            reward_loss = (
-                reward_loss
-                + math.soft_ce(rew_pred_unbind, rew_unbind, self.cfg).mean()
-                * self.cfg.rho**t
-            )
-            for qs_unbind_unbind in qs_unbind.unbind(0):
-                value_loss = (
-                    value_loss
-                    + math.soft_ce(qs_unbind_unbind, td_targets_unbind, self.cfg).mean()
-                    * self.cfg.rho**t
-                )
-
-        consistency_loss = consistency_loss / self.cfg.horizon
-        reward_loss = reward_loss / self.cfg.horizon
-        termination_loss = (
-            F.binary_cross_entropy_with_logits(termination_pred, terminated)
-            if self.cfg.episodic
-            else reward_loss.new_zeros(())
-        )
-        value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
-        total_loss = (
-            self.cfg.consistency_coef * consistency_loss
-            + self.cfg.reward_coef * reward_loss
-            + self.cfg.termination_coef * termination_loss
-            + self._contrastive_coef * contrastive_loss
-            + self.cfg.value_coef * value_loss
-        )
-        score_loss = total_loss.new_zeros(())
-        if bool(getattr(self.cfg, "use_score_network", False)):
-            score_task = task
-            if task is not None and torch.is_tensor(task):
-                score_task = task.reshape(-1)[:1]
-            x_tau, tau_idx, target_score = self._mc_score_target(zs[0, 0:1], score_task)
-            pred_score = self.model.score(
-                zs[0, 0:1], x_tau.unsqueeze(0), tau_idx, score_task
-            ).squeeze(0)
-            score_loss = F.mse_loss(pred_score, target_score.detach())
-            total_loss = (
-                total_loss
-                + float(getattr(self.cfg, "score_loss_coef", 1.0)) * score_loss
-            )
-        return (
-            zs.detach(),
-            consistency_loss,
-            reward_loss,
-            value_loss,
-            contrastive_loss,
-            termination_loss,
-            score_loss,
-            total_loss,
-            termination_pred,
-        )
-
-    def _update(self, obs, action, reward, terminated, task=None):
-        self.model.train()
-        (
-            zs,
-            consistency_loss,
-            reward_loss,
-            value_loss,
-            contrastive_loss,
-            termination_loss,
-            score_loss,
-            total_loss,
-            termination_pred,
-        ) = self._compiled_update_core(
-            obs,
-            action,
-            reward,
-            terminated,
-            task,
-        )
-
-        # Update model
-        total_loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), self.cfg.grad_clip_norm
-        )
-        self.optim.step()
-        self.optim.zero_grad(set_to_none=True)
-
-        # Update policy
-        pi_info = self.update_pi(zs.detach(), task)
-
-        # Update target Q-functions
-        self.model.soft_update_target_Q()
-
-        # Return training statistics
-        self.model.eval()
-        info_dict = {
-            "consistency_loss": consistency_loss,
-            "reward_loss": reward_loss,
-            "value_loss": value_loss,
-            "contrastive_loss": contrastive_loss,
-            "termination_loss": termination_loss,
-            "score_loss": score_loss,
-            "total_loss": total_loss,
-            "grad_norm": grad_norm,
-        }
-        info = TensorDict(info_dict)
-        if self.cfg.episodic:
-            info.update(
-                math.termination_statistics(
-                    torch.sigmoid(termination_pred[-1]), terminated[-1]
-                )
-            )
-        info.update(pi_info)
-        return info.detach().mean()
-
-    def update(self, buffer):
-        """
-        Main update function. Corresponds to one iteration of model learning.
-
-        Args:
-                buffer (common.buffer.Buffer): Replay buffer.
-
-        Returns:
-                dict: Dictionary of training statistics.
-        """
-        obs, action, reward, terminated, task = buffer.sample()
-        kwargs = {}
-        if task is not None:
-            kwargs["task"] = task
-        return self._update(obs, action, reward, terminated, **kwargs)
+        with open(fp, "rb") as f:
+            payload = pickle.load(f)
+        self.state = payload["state"]
+        return self

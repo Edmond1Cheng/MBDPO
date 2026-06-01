@@ -1,192 +1,146 @@
-import torch
+import jax
+import jax.numpy as jnp
+
+from .common import world_model as wm
 
 
-class Diffusion:
-    """No-gradient model-based diffusion planner for TD-MPC2."""
+def make_plan_step(spec: wm.ModelSpec, estimate_value_fn):
+    """Build the JIT-compiled diffusion planner used by the JAX agent."""
+    betas = jnp.linspace(spec.diffusion_beta0, spec.diffusion_betaT, spec.diffusion_steps)
+    alphas = 1.0 - betas
+    alpha_bar = jnp.cumprod(alphas)
 
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self._num_steps = max(int(cfg.diffusion_steps), 2)
-        self._num_samples = int(cfg.diffusion_num_samples)
-        self._temperature = float(cfg.diffusion_temperature)
-        self._action_noise = float(cfg.diffusion_action_noise)
-        self._num_elites = int(getattr(cfg, "diffusion_num_elites", 0) or 0)
-        self._num_pi_trajs = int(getattr(cfg, "diffusion_num_pi_trajs", 0) or 0)
-
-        self._eval_compile = bool(getattr(cfg, "diffusion_eval_compile", True))
-        self._eval_compile_mode = str(
-            getattr(cfg, "diffusion_eval_compile_mode", "reduce-overhead")
+    @jax.jit
+    def plan_step(
+        params,
+        prev_mean,
+        key,
+        obs,
+        t0,
+        eval_mode,
+        contrastive_mean,
+        contrastive_std,
+        task,
+    ):
+        key, k_encode, k_loop, k_action = jax.random.split(key, 4)
+        task_arg = task if spec.multitask else None
+        z0 = wm.encode(params, obs[None], spec, task=task_arg, key=k_encode)
+        z = jnp.repeat(z0, spec.diffusion_num_samples, axis=0)
+        shifted = jnp.concatenate(
+            [prev_mean[1:], jnp.zeros_like(prev_mean[:1])], axis=0
         )
+        mean0 = jnp.where(t0, jnp.zeros_like(prev_mean), shifted)
+        x_tau = jnp.sqrt(alpha_bar[-1]) * mean0
+        if spec.multitask:
+            x_tau = x_tau * wm.action_mask(task_arg, spec, x_tau)
 
-        self._schedule_cache = {}
-        self._compiled_eval_value_fn = None
-        self._compiled_eval_agent_id = None
-
-    def _get_value_fn(self, agent, eval_mode):
-        """Return value estimation function, optionally compiled for eval-only hot path."""
-        if not (eval_mode and self._eval_compile):
-            return None
-        agent_id = id(agent)
-        if (
-            self._compiled_eval_value_fn is None
-            or self._compiled_eval_agent_id != agent_id
-        ):
-
-            def _value_fn(z, actions, task):
-                return agent._estimate_value(z, actions, task)
-
-            self._compiled_eval_value_fn = torch.compile(
-                _value_fn, mode=self._eval_compile_mode
-            )
-            self._compiled_eval_agent_id = agent_id
-        return self._compiled_eval_value_fn
-
-    def _get_schedule(self, device):
-        """Return cached (betas, alphas, alpha_bar) diffusion schedule for a device."""
-        cache_key = str(device)
-        if cache_key not in self._schedule_cache:
-            betas = torch.linspace(
-                self.cfg.diffusion_beta0,
-                self.cfg.diffusion_betaT,
-                self._num_steps,
-                device=device,
-            )
-            alphas = 1.0 - betas
-            alpha_bar = torch.cumprod(alphas, dim=0)
-            self._schedule_cache[cache_key] = (betas, alphas, alpha_bar)
-        return self._schedule_cache[cache_key]
-
-    @torch.no_grad()
-    def plan(self, agent, obs, t0=False, eval_mode=False, task=None):
-        cfg = self.cfg
-        device = agent.device
-        num_steps = self._num_steps
-        num_samples = self._num_samples
-        temperature = self._temperature
-        action_noise = self._action_noise
-        value_fn = self._get_value_fn(agent, eval_mode)
-
-        z0 = agent.model.encode(obs, task)
-        z = z0.repeat(num_samples, 1)
-
-        _, alphas, alpha_bar = self._get_schedule(device)
-
-        if t0:
-            mean0 = torch.zeros(cfg.horizon, cfg.action_dim, device=device)
-        else:
-            mean0 = torch.cat(
-                [
-                    agent._prev_mean[1:],
-                    torch.zeros_like(agent._prev_mean[:1]),
-                ],
-                dim=0,
-            )
-
-        x_tau = torch.sqrt(alpha_bar[-1]) * mean0
-        action_mask = None
-        if cfg.multitask:
-            action_mask = agent.model._action_masks[task].squeeze(0)
-            x_tau = x_tau * action_mask
-
-        num_elites = self._num_elites
-        num_pi_trajs = self._num_pi_trajs
-        score_only_inference = bool(
-            getattr(cfg, "score_only_inference", False)
-        ) and bool(getattr(cfg, "use_score_network", False))
-
-        if score_only_inference:
-            for tau in range(num_steps - 1, 0, -1):
-                alpha_bar_tau = alpha_bar[tau]
-                score = agent.model.score(
-                    z0, x_tau.unsqueeze(0), torch.tensor([tau], device=device), task
-                ).squeeze(0)
-                x_tau = (x_tau + (1.0 - alpha_bar_tau) * score) / torch.sqrt(
-                    alphas[tau]
+        def loop_body(i, carry):
+            x_t, loop_key = carry
+            tau = spec.diffusion_steps - 1 - i
+            loop_key, k_eps, k_value, k_pi = jax.random.split(loop_key, 4)
+            alpha_bar_tau = alpha_bar[tau]
+            if spec.score_only_inference and spec.use_score_network:
+                score = wm.score(
+                    params,
+                    z0,
+                    x_t[None],
+                    jnp.asarray([tau], dtype=jnp.int32),
+                    spec,
+                    task=task_arg,
+                )[0]
+            else:
+                mean_cond = x_t / jnp.sqrt(alpha_bar_tau)
+                std_cond = jnp.sqrt((1.0 - alpha_bar_tau) / alpha_bar_tau)
+                eps = jax.random.normal(
+                    k_eps,
+                    (spec.diffusion_num_samples, spec.horizon, spec.action_dim),
+                    dtype=x_t.dtype,
                 )
-                if action_mask is not None:
-                    x_tau = x_tau * action_mask
-        else:
-            for tau in range(num_steps - 1, 0, -1):
-                alpha_bar_tau = alpha_bar[tau]
-                mean_cond = x_tau / torch.sqrt(alpha_bar_tau)
-                std_cond = torch.sqrt((1.0 - alpha_bar_tau) / alpha_bar_tau)
-                eps = torch.randn(
-                    num_samples, cfg.horizon, cfg.action_dim, device=device
-                )
-                a0_samples = mean_cond.unsqueeze(0) + std_cond * eps
-                if action_mask is not None:
-                    a0_samples = a0_samples * action_mask
-                a0_samples = a0_samples.clamp(-1, 1)
+                a0_samples = jnp.clip(mean_cond[None] + std_cond * eps, -1.0, 1.0)
+                if spec.multitask:
+                    a0_samples = a0_samples * wm.action_mask(task_arg, spec, a0_samples)
 
-                if num_pi_trajs > 0:
-                    pi_trajs = min(num_pi_trajs, num_samples)
-                    pi_actions = torch.empty(
-                        pi_trajs, cfg.horizon, cfg.action_dim, device=device
+                if spec.diffusion_num_pi_trajs > 0:
+                    pi_trajs = min(
+                        spec.diffusion_num_pi_trajs, spec.diffusion_num_samples
                     )
-                    z_pi = z0.repeat(pi_trajs, 1)
-                    for t in range(cfg.horizon):
-                        a_pi, _ = agent.model.pi(z_pi, task)
-                        if action_mask is not None:
-                            a_pi = a_pi * action_mask
-                        a_pi = a_pi.clamp(-1, 1)
-                        pi_actions[:, t] = a_pi
-                        z_pi = agent.model.next(z_pi, a_pi, task)
-                    a0_samples[:pi_trajs] = pi_actions
+                    pi_keys = jax.random.split(k_pi, spec.horizon)
 
-                actions_for_value = a0_samples.permute(1, 0, 2)
-                if value_fn is None:
-                    values = agent._estimate_value(z, actions_for_value, task)
-                else:
-                    values = value_fn(z, actions_for_value, task)
-                values = values.nan_to_num(0.0).squeeze(-1)
+                    def pi_body(z_pi, pi_key):
+                        a_pi, _ = wm.pi(params, z_pi, pi_key, spec, task=task_arg)
+                        a_pi = jnp.clip(a_pi, -1.0, 1.0)
+                        z_next = wm.next_latent(params, z_pi, a_pi, spec, task=task_arg)
+                        return z_next, a_pi
 
-                g_mean = values.mean()
-                g_std = values.std()
-                if g_std < 1e-4:
-                    g_std = torch.tensor(1.0, device=device)
-                logits = (values - g_mean) / g_std
-                logits = logits / max(temperature, 1e-6)
-                if num_elites > 0 and num_elites < num_samples:
-                    elite_idx = torch.topk(values, num_elites, dim=0).indices
-                    elite_logits = logits[elite_idx]
-                    elite_logits = elite_logits - elite_logits.max()
-                    elite_weights = torch.softmax(elite_logits, dim=0)
-                    a_bar = (elite_weights[:, None, None] * a0_samples[elite_idx]).sum(
-                        dim=0
+                    z_pi0 = jnp.repeat(z0, pi_trajs, axis=0)
+                    _, pi_actions = jax.lax.scan(pi_body, z_pi0, pi_keys)
+                    pi_actions = jnp.swapaxes(pi_actions, 0, 1)
+                    a0_samples = a0_samples.at[:pi_trajs].set(pi_actions)
+
+                values = estimate_value_fn(
+                    params,
+                    z,
+                    jnp.swapaxes(a0_samples, 0, 1),
+                    spec,
+                    contrastive_mean,
+                    contrastive_std,
+                    k_value,
+                    task=task_arg,
+                )
+                values = jnp.nan_to_num(values[:, 0], nan=0.0)
+                raw_value_std = jnp.std(values, ddof=1)
+                value_std = jnp.where(raw_value_std < 1e-4, 1.0, raw_value_std)
+                logits = (values - jnp.mean(values)) / value_std
+                logits = logits / max(spec.diffusion_temperature, 1e-6)
+                if (
+                    spec.diffusion_num_elites > 0
+                    and spec.diffusion_num_elites < spec.diffusion_num_samples
+                ):
+                    _, elite_idx = jax.lax.top_k(values, spec.diffusion_num_elites)
+                    elite_logits = logits[elite_idx] - jnp.max(logits[elite_idx])
+                    weights = jax.nn.softmax(elite_logits, axis=0)
+                    a_bar = jnp.sum(
+                        weights[:, None, None] * a0_samples[elite_idx], axis=0
                     )
                 else:
-                    weights = torch.softmax(logits, dim=0)
-                    a_bar = (weights[:, None, None] * a0_samples).sum(dim=0)
+                    weights = jax.nn.softmax(logits, axis=0)
+                    a_bar = jnp.sum(weights[:, None, None] * a0_samples, axis=0)
 
-                score_mb = (-x_tau + torch.sqrt(alpha_bar_tau) * a_bar) / (
+                score_mb = (-x_t + jnp.sqrt(alpha_bar_tau) * a_bar) / (
                     1.0 - alpha_bar_tau + 1e-8
                 )
                 score = (
-                    agent.model.score(
-                        z0, x_tau.unsqueeze(0), torch.tensor([tau], device=device), task
-                    ).squeeze(0)
-                    if bool(getattr(cfg, "use_score_network", False))
+                    wm.score(
+                        params,
+                        z0,
+                        x_t[None],
+                        jnp.asarray([tau], dtype=jnp.int32),
+                        spec,
+                        task=task_arg,
+                    )[0]
+                    if spec.use_score_network
                     else score_mb
                 )
+            x_next = (x_t + (1.0 - alpha_bar_tau) * score) / jnp.sqrt(alphas[tau])
+            if spec.multitask:
+                x_next = x_next * wm.action_mask(task_arg, spec, x_next)
+            return (x_next, loop_key)
 
-                x_tau = (x_tau + (1.0 - alpha_bar_tau) * score) / torch.sqrt(
-                    alphas[tau]
-                )
-                if action_mask is not None:
-                    x_tau = x_tau * action_mask
-
-        x0 = x_tau
-        if action_mask is not None:
-            x0 = x0 * action_mask
-        x0 = x0.clamp(-1, 1)
-        agent._prev_mean.copy_(x0.detach())
-
+        x0, _ = jax.lax.fori_loop(
+            0, spec.diffusion_steps - 1, loop_body, (x_tau, k_loop)
+        )
+        x0 = jnp.clip(x0, -1.0, 1.0)
+        if spec.multitask:
+            x0 = x0 * wm.action_mask(task_arg, spec, x0)
         action = x0[0]
-        if not eval_mode:
-            action = action + torch.randn_like(action) * action_noise
-            if action_mask is not None:
-                action = action * action_mask
-        action = action.clamp(-1, 1)
+        noise = jax.random.normal(k_action, action.shape, dtype=action.dtype)
+        action = jnp.where(
+            eval_mode,
+            action,
+            jnp.clip(action + spec.diffusion_action_noise * noise, -1.0, 1.0),
+        )
+        if spec.multitask:
+            action = action * wm.action_mask(task_arg, spec, action)
+        return action, x0, key
 
-        agent._last_imagined_z_traj = None
-        return action
+    return plan_step

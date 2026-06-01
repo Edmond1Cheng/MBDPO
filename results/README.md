@@ -2,14 +2,20 @@
 
 This document lists **every task** in each task set/domain used by this repository, and how to pass them to training/evaluation scripts.
 
+## JAX Implementation Results
+
+The experimental JAX implementation results are indexed separately in
+[results/jax_implementation/README.md](jax_implementation/README.md).
+
+Those results are targeted validation and speed checks, not a full reproduction of
+all paper tasks. They cover single-task state online runs, fixed-replay
+reference/JAX loss comparisons, one extracted offline dataset, planner/update
+benchmarks, and pmap correctness checks.
+
 ## How to use task names
 
-You can pass a single task name (e.g., `task=dog-run`) or a task-set alias (e.g., `task=mt80`) to:
-
-- `scripts/evaluate.py`
-- `scripts/train.py`
-- `scripts/offline_to_online.py`
-- `scripts/online_parallel_train.py`
+You can pass a single task name (e.g., `task=dog-run`) or a task-set alias
+(e.g., `task=mt80`) to `scripts/train.py`.
 
 Multi-task training/evaluation is specified by:
 

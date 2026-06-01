@@ -8,6 +8,21 @@ logs/
 outputs/
 wandb/
 
+# Local experiment artifacts
+.DS_Store
+results/**/*.csv
+results/**/*.npz
+results/**/*.png
+results/**/*.pdf
+results/**/.DS_Store
+results/**/hydra/
+results/**/.hydra/
+offline_dataset/
+PROGRESS.md
+*.csv
+*.npz
+*.pt
+
 # HPC
 nautilus/*.yaml
 *.key

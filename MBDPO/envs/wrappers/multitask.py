@@ -1,6 +1,5 @@
 import gymnasium as gym
 import numpy as np
-import torch
 
 
 class MultitaskWrapper(gym.Wrapper):
@@ -39,19 +38,13 @@ class MultitaskWrapper(gym.Wrapper):
         return self.envs[self.task_idx]
 
     def rand_act(self):
-        return torch.from_numpy(self.action_space.sample().astype(np.float32))
+        return self.action_space.sample().astype(np.float32)
 
     def _pad_obs(self, obs):
+        obs = np.asarray(obs, dtype=np.float32)
         if obs.shape != self._obs_shape:
-            obs = torch.cat(
-                (
-                    obs,
-                    torch.zeros(
-                        self._obs_shape[0] - obs.shape[0],
-                        dtype=obs.dtype,
-                        device=obs.device,
-                    ),
-                )
+            obs = np.concatenate(
+                [obs, np.zeros(self._obs_shape[0] - obs.shape[0], dtype=obs.dtype)]
             )
         return obs
 

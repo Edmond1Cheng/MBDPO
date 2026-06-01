@@ -21,6 +21,43 @@ Official implementation of **"Scaling World-Model Reinforcement Learning Through
 
 The repository contains code for training and evaluating MBDPO across **121 continuous control tasks** in three settings: **online from scratch**, **multi-task offline pretraining**, and **offline-to-online (O2O) fine-tuning**.
 
+## JAX Implementation Branch
+
+This branch replaces the main package implementation with high-performance JAX
+code while keeping the same top-level structure: `MBDPO/mbdpo.py`,
+`MBDPO/diffusion.py`, and `MBDPO/common/world_model.py` are JAX implementations.
+The older side-by-side `jax_impl` package is not part of this branch.
+
+Current validation status:
+
+- Implemented paths: state and rgb world-model components, diffusion planner,
+  reward/value/consistency/contrastive/termination/score losses, offline sampler,
+  single-device JIT update, and `pmap + pmean` data-parallel update.
+- Validated paths: single-task state online on `cheetah-run`, fixed-replay
+  reference/JAX loss comparisons, one extracted `cheetah-run-back` offline dataset,
+  synthetic rgb/episodic/score/multitask checks, and pmap correctness.
+- Not yet validated as a full paper reproduction: all 121 tasks, full MT30/MT80
+  final quality, O2O fine-tuning quality, visual closed-loop training, and
+  hundred-GPU scale.
+
+Representative speed and alignment results are indexed in
+[`results/jax_implementation/`](results/jax_implementation/README.md):
+
+- JAX update weak scaling: `95,462 samples/s` on 1 GPU at batch 1024 and
+  `380,783 samples/s` on 4 GPUs at batch 4096, a `3.99x` throughput scale-up.
+- Fixed-replay online comparison on `cheetah-run` over 10k updates and 3 seeds:
+  JAX final update mean `18.54ms` vs Torch `37.69ms`; end-to-end wall-clock
+  `607.36s` vs `2930.48s`.
+- Compressed paper-style online run on `cheetah-run`, seed 81: 50k eval reward
+  matched closely (JAX `542.309`, Torch `541.7`); 100k eval reward was JAX
+  `766.558` vs Torch `708.6`.
+- Compressed offline same-data run on `cheetah-run-back`, seed 82: JAX final
+  update `50.572ms` vs Torch `78.225ms`; final eval reward was JAX `135.839`
+  vs Torch `159.704`.
+
+Treat these as implementation validation results, not as the paper's complete
+benchmark table.
+
 ## Highlight Visualization
 
 
@@ -100,42 +137,19 @@ The repository contains code for training and evaluating MBDPO across **121 cont
 We provide ready-to-use Conda environment files for different experiment suites.
 
 ```bash
-# Example: create environment for MT80 experiments
-conda env create -f conda_envs/mbdpo-mt80.yml
-conda activate mbdpo-mt80
-
-# Optional: other provided environments
-# conda env create -f conda_envs/mbdpo-ms2.yml
-# conda env create -f conda_envs/mbdpo-myo.yml
+# JAX implementation environment
+conda env create -f conda_envs/mbdpo-jax.yml
+conda activate mbdpo-jax
 ```
 
 See notes for each environment in this [link](conda_envs/README.md)
 
 ### Offline Pretraining Dataset
 
-For multi-task offline pretraining, we use the replay buffer results from open-sourced TD-MPC2 dataset ([mt80](https://huggingface.co/datasets/nicklashansen/tdmpc2/tree/main/mt80) & [mt30](https://huggingface.co/datasets/nicklashansen/tdmpc2/tree/main/mt30)).
-
-To download (remember to adjust the dataset path accordingly in configuration yaml files):
-
-- **mt30**:
-
-```bash
-mkdir -p ./offline_dataset/mt30
-
-seq 0 3 | xargs -I {} -P 4 wget -c \
-  -O ./offline_dataset/mt30/chunk_{}.pt \
-  "https://huggingface.co/datasets/nicklashansen/tdmpc2/resolve/main/mt80/chunk_{}.pt?download=true"
-```
-
-- **mt80**:
-
-```bash
-mkdir -p ./offline_dataset/mt80
-
-seq 0 19 | xargs -I {} -P 4 wget -c \
-  -O ./offline_dataset/mt80/chunk_{}.pt \
-  "https://huggingface.co/datasets/nicklashansen/tdmpc2/resolve/main/mt80/chunk_{}.pt?download=true"
-```
+For multi-task offline pretraining, this pure JAX branch expects NumPy `.npz`
+chunks. Each chunk should contain `obs`, `action`, `reward`, optional
+`terminated`, and optional `task` arrays. Raw binary chunks are local experiment
+artifacts and are intentionally not committed.
 
 ## Supported tasks
 
@@ -151,37 +165,32 @@ See this [link](results/README.md) for more detailed tasks and notes in each dom
 python scripts/train.py task=dog-run seed=1 steps=4000000
 ```
 
-or in the parallel launcher
-
-```bash
-python scripts/online_parallel_train.py --config cfgs/online_parallel_config.yaml
-```
-
 ### 2) Multi-task offline pretraining
 
 ```bash
-python scripts/train.py task=mt80 multitask=true
+python scripts/train.py task=mt80 data_dir=/path/to/mt80_npz_chunks
 # or
-python scripts/train.py task=mt30 multitask=true
+python scripts/train.py task=mt30 data_dir=/path/to/mt30_npz_chunks
 ```
 
-### 3) Offline-to-online (O2O) fine-tuning
+### 3) Benchmarks and correctness checks
 
 ```bash
-python scripts/offline_to_online.py \
-  checkpoint=/path/to/checkpoint.pt \
-  save_path=/path/to/output_dir \
-  off2on_task="walker-run" \
-  steps=40000
+# Compiled update/planner benchmark
+python scripts/jax_benchmark.py --data-parallel-devices 4 --data-parallel-batch-size 4096
+
+# Multi-device pmap correctness check
+python scripts/jax_parallel_correctness.py --devices 4 --batch-size 128
 ```
+
+The JAX implementation has not been validated on every paper task. See
+[`results/jax_implementation/`](results/jax_implementation/README.md) for the
+tested scope and current speed/alignment results.
 
 ### 4) Evaluation
 
 ```bash
-python scripts/evaluate.py \
-  task=mt80 \
-  checkpoint=/path/to/checkpoint.pt \
-  eval_episodes=10
+python scripts/train.py task=cheetah-run steps=0 eval_freq=1 eval_episodes=10
 ```
 
 About parameter usage, please refer to this [description](cfgs/README.md)

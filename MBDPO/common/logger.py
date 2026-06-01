@@ -162,7 +162,7 @@ class Logger:
 
     def save_agent(self, agent=None, identifier="final"):
         if self._save_agent and agent:
-            fp = self._model_dir / f"{str(identifier)}.pt"
+            fp = self._model_dir / f"{str(identifier)}.pkl"
             agent.save(fp)
             if self._wandb:
                 artifact = self._wandb.Artifact(

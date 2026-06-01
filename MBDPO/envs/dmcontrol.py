@@ -2,7 +2,6 @@ from collections import defaultdict, deque
 
 import gymnasium as gym
 import numpy as np
-import torch
 
 from envs.tasks import cheetah, walker, hopper, reacher, ball_in_cup, pendulum, fish
 from dm_control import suite
@@ -48,9 +47,7 @@ class DMControlWrapper:
         return self.env
 
     def _obs_to_array(self, obs):
-        return torch.from_numpy(
-            np.concatenate([v.flatten() for v in obs.values()], dtype=np.float32)
-        )
+        return np.concatenate([v.flatten() for v in obs.values()]).astype(np.float32)
 
     def reset(self):
         return self._obs_to_array(self.env.reset().observation)
@@ -84,7 +81,7 @@ class Pixels(gym.Wrapper):
         num_frames = self._frames.maxlen if is_reset else 1
         for _ in range(num_frames):
             self._frames.append(frame)
-        return torch.from_numpy(np.concatenate(self._frames))
+        return np.concatenate(self._frames).astype(np.uint8)
 
     def reset(self):
         self.env.reset()

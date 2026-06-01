@@ -1,124 +1,78 @@
-import torch
-from tensordict.tensordict import TensorDict
-from torchrl.data.replay_buffers import ReplayBuffer, LazyTensorStorage
-from torchrl.data.replay_buffers.samplers import SliceSampler
+from collections import deque
+
+import numpy as np
 
 
 class Buffer:
-    """
-    Replay buffer for TD-MPC2 training. Based on torchrl.
-    Uses CUDA memory if available, and CPU memory otherwise.
-    """
+    """Episode replay buffer for JAX training."""
 
     def __init__(self, cfg):
-        self.cfg = cfg
-        self._device = torch.device("cuda:0")
-        self._capacity = min(cfg.buffer_size, cfg.steps)
-        self._sampler = SliceSampler(
-            num_slices=self.cfg.batch_size,
-            end_key=None,
-            traj_key="episode",
-            truncated_key=None,
-            strict_length=True,
-            cache_values=cfg.multitask,
-        )
-        self._batch_size = cfg.batch_size * (cfg.horizon + 1)
-        self._num_eps = 0
+        self.horizon = int(cfg.horizon)
+        self.batch_size = int(cfg.batch_size)
+        self.capacity = int(min(cfg.buffer_size, cfg.steps))
+        self._episodes = deque()
+        self._transitions = 0
+        self._rng = np.random.default_rng(int(cfg.seed))
 
     @property
-    def capacity(self):
-        """Return the capacity of the buffer."""
-        return self._capacity
+    def num_episodes(self):
+        return len(self._episodes)
 
     @property
-    def num_eps(self):
-        """Return the number of episodes in the buffer."""
-        return self._num_eps
+    def num_transitions(self):
+        return self._transitions
 
-    def _reserve_buffer(self, storage):
-        """
-        Reserve a buffer with the given storage.
-        """
-        return ReplayBuffer(
-            storage=storage,
-            sampler=self._sampler,
-            pin_memory=False,
-            prefetch=0,
-            batch_size=self._batch_size,
-        )
+    def add_episode(self, obs, action, reward, terminated, task=None):
+        obs = np.asarray(obs, dtype=np.float32)
+        action = np.asarray(action, dtype=np.float32)
+        reward = np.asarray(reward, dtype=np.float32).reshape(-1, 1)
+        terminated = np.asarray(terminated, dtype=np.float32).reshape(-1, 1)
+        if action.shape[0] < self.horizon:
+            return
+        if obs.shape[0] != action.shape[0] + 1:
+            raise ValueError(
+                f"Expected T+1 observations for T actions, got {obs.shape[0]} and {action.shape[0]}."
+            )
+        episode = {
+            "obs": obs,
+            "action": action,
+            "reward": reward,
+            "terminated": terminated,
+            "task": None if task is None else int(task),
+            "length": action.shape[0],
+        }
+        self._episodes.append(episode)
+        self._transitions += episode["length"]
+        while self._transitions > self.capacity and self._episodes:
+            removed = self._episodes.popleft()
+            self._transitions -= removed["length"]
 
-    def _init(self, tds):
-        """Initialize the replay buffer. Use the first episode to estimate storage requirements."""
-        print(f"Buffer capacity: {self._capacity:,}")
-        mem_free, _ = torch.cuda.mem_get_info()
-        bytes_per_step = sum(
-            [
-                (
-                    v.numel() * v.element_size()
-                    if not isinstance(v, TensorDict)
-                    else sum([x.numel() * x.element_size() for x in v.values()])
-                )
-                for v in tds.values()
-            ]
-        ) / len(tds)
-        total_bytes = bytes_per_step * self._capacity
-        print(f"Storage required: {total_bytes/1e9:.2f} GB")
-        # Heuristic: decide whether to use CUDA or CPU memory
-        storage_device = "cuda:0" if 2.5 * total_bytes < mem_free else "cpu"
-        print(f"Using {storage_device.upper()} memory for storage.")
-        self._storage_device = torch.device(storage_device)
-        return self._reserve_buffer(
-            LazyTensorStorage(self._capacity, device=self._storage_device)
-        )
-
-    def load(self, td):
-        """
-        Load a batch of episodes into the buffer. This is useful for loading data from disk,
-        and is more efficient than adding episodes one by one.
-        """
-        num_new_eps = len(td)
-        episode_idx = torch.arange(
-            self._num_eps, self._num_eps + num_new_eps, dtype=torch.int64
-        )
-        td["episode"] = episode_idx.unsqueeze(-1).expand(-1, td["reward"].shape[1])
-        if self._num_eps == 0:
-            self._buffer = self._init(td[0])
-        td = td.reshape(td.shape[0] * td.shape[1])
-        self._buffer.extend(td)
-        self._num_eps += num_new_eps
-        return self._num_eps
-
-    def add(self, td):
-        """Add an episode to the buffer."""
-        td["episode"] = torch.full_like(td["reward"], self._num_eps, dtype=torch.int64)
-        if self._num_eps == 0:
-            self._buffer = self._init(td)
-        self._buffer.extend(td)
-        self._num_eps += 1
-        return self._num_eps
-
-    def _prepare_batch(self, td):
-        """
-        Prepare a sampled batch for training (post-processing).
-        Expects `td` to be a TensorDict with batch size TxB.
-        """
-        td = td.select(
-            "obs", "action", "reward", "terminated", "task", strict=False
-        ).to(self._device, non_blocking=True)
-        obs = td.get("obs").contiguous()
-        action = td.get("action")[1:].contiguous()
-        reward = td.get("reward")[1:].unsqueeze(-1).contiguous()
-        terminated = td.get("terminated", None)
-        if terminated is not None:
-            terminated = td.get("terminated")[1:].unsqueeze(-1).contiguous()
-        else:
-            terminated = torch.zeros_like(reward)
-        task = td.get("task", None)
-        if task is not None:
-            task = task[0].contiguous()
-        return obs, action, reward, terminated, task
+    def can_sample(self):
+        return any(ep["length"] >= self.horizon for ep in self._episodes)
 
     def sample(self):
-        """Sample a batch of subsequences from the buffer."""
-        td = self._buffer.sample().view(-1, self.cfg.horizon + 1).permute(1, 0)
-        return self._prepare_batch(td)
+        if not self.can_sample():
+            raise RuntimeError("Replay buffer does not contain enough data to sample.")
+        valid = [ep for ep in self._episodes if ep["length"] >= self.horizon]
+        ep_indices = self._rng.integers(0, len(valid), size=self.batch_size)
+        obs_batch, action_batch, reward_batch, terminated_batch, task_batch = [], [], [], [], []
+        for ep_idx in ep_indices:
+            ep = valid[int(ep_idx)]
+            start = int(self._rng.integers(0, ep["length"] - self.horizon + 1))
+            end = start + self.horizon
+            obs_batch.append(ep["obs"][start : end + 1])
+            action_batch.append(ep["action"][start:end])
+            reward_batch.append(ep["reward"][start:end])
+            terminated_batch.append(ep["terminated"][start:end])
+            if ep["task"] is not None:
+                task_batch.append(ep["task"])
+
+        batch = {
+            "obs": np.stack(obs_batch, axis=1),
+            "action": np.stack(action_batch, axis=1),
+            "reward": np.stack(reward_batch, axis=1),
+            "terminated": np.stack(terminated_batch, axis=1),
+        }
+        if task_batch:
+            batch["task"] = np.asarray(task_batch, dtype=np.int32)
+        return batch
