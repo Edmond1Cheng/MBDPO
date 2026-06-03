@@ -448,6 +448,7 @@ def _fill_cfg_from_npz(cfg, fp):
         episode_length = int(np.max(np.asarray(data["lengths"], dtype=np.int32)))
     else:
         episode_length = int(transition_count)
+    data.close()
     action_dim = int(action.shape[-1])
     cfg.obs_shape = {str(cfg.obs): obs_shape}
     cfg.action_dim = action_dim
