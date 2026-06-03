@@ -348,7 +348,10 @@ class NpzOfflineSampler:
         if task is not None:
             task = self._episode_task_ids(task, obs.shape[0], fp)
         elif bool(getattr(self.cfg, "multitask", False)):
-            raise ValueError(f"{fp} is missing required `task` ids for multitask offline training.")
+            raise ValueError(
+                f"{fp} is missing required `task` ids for multitask offline training."
+            )
+        data.close()
         return {
             "obs": obs,
             "action": np.nan_to_num(action),
