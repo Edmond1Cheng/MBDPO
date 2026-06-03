@@ -14,6 +14,10 @@ This folder contains the Hydra/YAML configuration files used by the training, fi
 
 In other words, these workflows share one unified base schema and differ mainly in runtime overrides (e.g., `task`, `steps`, checkpoint paths, etc.).
 
+The experimental JAX backend also consumes `config.yaml`, but uses the separate
+entry point `scripts/train_jax.py` and code under `MBDPO/jax_impl/`. The default
+Torch entry point remains `scripts/train.py`.
+
 ### `online_parallel_config.yaml` (parallel launcher config)
 
 `cfgs/online_parallel_config.yaml` is a **specialized config** for:
@@ -25,6 +29,10 @@ It controls how multiple jobs are generated and dispatched in parallel (task set
 ## Dependency / usage relationship
 
 - `scripts/train.py`, `scripts/evaluate.py`, and `scripts/offline_to_online.py` consume parameters following the base schema in `config.yaml`.
+- `scripts/train_jax.py` consumes the same base schema, sets
+  `backend=jax`, and supports `mode=auto|online|offline`,
+  `jax_data_parallel_devices`, `jax_updates_per_step`,
+  `jax_seed_pretrain`, and `jax_log_freq`.
 - `scripts/online_parallel_train.py` first reads `online_parallel_config.yaml`, then materializes per-task/per-seed command overrides that are forwarded to the standard training entry (`train_entry`, default `scripts/train.py`).
 - Therefore, parallel training = `online_parallel_config.yaml` (dispatch strategy) + `config.yaml`-compatible overrides (actual algorithm/training params).
 
@@ -59,6 +67,15 @@ Below are the most important groups, with emphasis on diffusion-related controls
 - `save_replay`, `replay_save_dir`, `replay_flush_every_episodes`, `replay_include_terminated`, `replay_task_id`: replay exporting controls.
 - `save_reward_csv`, `reward_csv_dir`, `csv_eval_freq`: periodic reward CSV export.
 - `save_model_every`, `eval_freq`, `eval_episodes`: model checkpoint and evaluation frequency.
+
+### JAX backend controls
+
+- `backend`: runtime I/O backend for shared env wrappers; Torch scripts keep
+  `torch`, while `scripts/train_jax.py` sets `jax`.
+- `mode`: JAX training route (`auto`, `online`, or `offline`).
+- `jax_data_parallel_devices`: number of local JAX devices for pmap updates.
+- `jax_updates_per_step`, `jax_seed_pretrain`, `jax_log_freq`: JAX online/offline
+  update and logging controls.
 
 ## Key parameters in `online_parallel_config.yaml`
 

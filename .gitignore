@@ -1,4 +1,5 @@
 # Logging
+.DS_Store
 MBDPO/logs/
 MBDPO/outputs/
 MBDPO/wandb/
