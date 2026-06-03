@@ -157,7 +157,29 @@ or in the parallel launcher
 python scripts/online_parallel_train.py --config cfgs/online_parallel_config.yaml
 ```
 
-### 2) Multi-task offline pretraining
+### 2) JAX backend
+
+The default training entry remains the Torch implementation. The JAX
+implementation is namespaced under `MBDPO/jax_impl/` and uses a separate entry point:
+
+```bash
+# JAX single-task online
+python scripts/train_jax.py task=cheetah-run steps=100000 model_size=1
+
+# JAX offline from NumPy .npz chunks
+python scripts/train_jax.py mode=offline task=mt30 data_dir=/path/to/mt30_npz_chunks
+
+# JAX data-parallel updates
+python scripts/train_jax.py mode=offline task=mt30 data_dir=/path/to/mt30_npz_chunks \
+  batch_size=4096 jax_data_parallel_devices=4
+```
+
+The JAX backend shares environment construction and common config/logger/task
+metadata with the Torch path, but keeps JAX-specific model, math, replay buffer,
+diffusion planner, and data-parallel update code under `MBDPO/jax_impl/`. It has not
+been validated on every paper task.
+
+### 3) Multi-task offline pretraining
 
 ```bash
 python scripts/train.py task=mt80 multitask=true
@@ -165,7 +187,7 @@ python scripts/train.py task=mt80 multitask=true
 python scripts/train.py task=mt30 multitask=true
 ```
 
-### 3) Offline-to-online (O2O) fine-tuning
+### 4) Offline-to-online (O2O) fine-tuning
 
 ```bash
 python scripts/offline_to_online.py \
@@ -175,7 +197,7 @@ python scripts/offline_to_online.py \
   steps=40000
 ```
 
-### 4) Evaluation
+### 5) Evaluation
 
 ```bash
 python scripts/evaluate.py \

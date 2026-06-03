@@ -84,7 +84,7 @@ def make_env(cfg):
             raise ValueError(
                 f'Failed to make environment "{cfg.task}": please verify that dependencies are installed and that the task exists.'
             )
-        env = TensorWrapper(env)
+        env = TensorWrapper(env, backend=getattr(cfg, "backend", "torch"))
     try:  # Dict
         cfg.obs_shape = {k: v.shape for k, v in env.observation_space.spaces.items()}
     except:  # Box
